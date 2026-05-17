@@ -10,7 +10,9 @@ use ipnetwork::{Ipv4Network, Ipv6Network};
 use crate::config::{DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort};
 use crate::dns::Nameserver;
 use crate::policy::{BuildError, NetworkPolicy};
-use crate::secrets::config::{HostPattern, SecretEntry, SecretInjection, ViolationAction};
+use crate::secrets::config::{
+    HostPattern, SecretEntry, SecretInjection, SecretValue, ViolationAction,
+};
 use crate::tls::TlsConfig;
 
 //--------------------------------------------------------------------------------------------------
@@ -45,7 +47,7 @@ pub struct TlsBuilder {
 /// ```
 pub struct SecretBuilder {
     env_var: Option<String>,
-    value: Option<String>,
+    value: Option<SecretValue>,
     placeholder: Option<String>,
     allowed_hosts: Vec<HostPattern>,
     injection: SecretInjection,
@@ -166,10 +168,13 @@ impl NetworkBuilder {
     }
 
     /// Shorthand: add a secret with env var, value, placeholder, and allowed host.
+    ///
+    /// `value` accepts `String`, `&str`, or `PathBuf` (host file whose
+    /// contents are re-read at each connection-setup).
     pub fn secret_env(
         mut self,
         env_var: impl Into<String>,
-        value: impl Into<String>,
+        value: impl Into<SecretValue>,
         placeholder: impl Into<String>,
         allowed_host: impl Into<String>,
     ) -> Self {
@@ -382,7 +387,13 @@ impl SecretBuilder {
     }
 
     /// Set the secret value (required).
-    pub fn value(mut self, value: impl Into<String>) -> Self {
+    ///
+    /// Accepts a literal (`String`, `&str`) or a host file path
+    /// (`PathBuf` → `SecretValue::File`). File-backed secrets are
+    /// re-read at each connection-setup so a host-rotating credential
+    /// is picked up on the next request without re-creating the
+    /// sandbox.
+    pub fn value(mut self, value: impl Into<SecretValue>) -> Self {
         self.value = Some(value.into());
         self
     }

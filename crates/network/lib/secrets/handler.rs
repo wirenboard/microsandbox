@@ -125,22 +125,45 @@ impl SecretsHandler {
         let mut all_placeholders = Vec::new();
 
         for secret in &config.secrets {
+            // Placeholders go into the violation-detection set unconditionally
+            // so a leak to a disallowed host (or an unresolvable secret) still
+            // trips the violation check.
             all_placeholders.push(secret.placeholder.clone());
 
             let host_allowed = secret.allowed_hosts.is_empty()
                 || secret.allowed_hosts.iter().any(|p| p.matches(sni));
-
-            if host_allowed {
-                eligible.push(EligibleSecret {
-                    placeholder: secret.placeholder.clone(),
-                    value: secret.value.clone(),
-                    inject_headers: secret.injection.headers,
-                    inject_basic_auth: secret.injection.basic_auth,
-                    inject_query_params: secret.injection.query_params,
-                    inject_body: secret.injection.body,
-                    require_tls_identity: secret.require_tls_identity,
-                });
+            if !host_allowed {
+                continue;
             }
+
+            // Resolve the secret value at connection-setup time. For
+            // `SecretValue::Static` this is a cheap clone; for
+            // `SecretValue::File` this reads from disk. If the file is
+            // unreadable, skip the secret rather than substitute an empty
+            // string — the request will go upstream with the placeholder
+            // intact, which the upstream server can reject and the violation
+            // detector will catch if the host turns out to be disallowed.
+            let value = match secret.value.resolve() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        env_var = %secret.env_var,
+                        error = %e,
+                        "failed to resolve secret value; skipping substitution for this connection"
+                    );
+                    continue;
+                }
+            };
+
+            eligible.push(EligibleSecret {
+                placeholder: secret.placeholder.clone(),
+                value,
+                inject_headers: secret.injection.headers,
+                inject_basic_auth: secret.injection.basic_auth,
+                inject_query_params: secret.injection.query_params,
+                inject_body: secret.injection.body,
+                require_tls_identity: secret.require_tls_identity,
+            });
         }
 
         let has_ineligible = eligible.len() < all_placeholders.len();

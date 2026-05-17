@@ -487,14 +487,20 @@ impl SandboxBuilder {
     /// Placeholder is auto-generated as `$MSB_<env_var>`.
     /// Automatically enables TLS interception.
     ///
+    /// `value` accepts a literal (`String`, `&str`) or a host file path
+    /// (`PathBuf`). File-backed secrets are re-read at each
+    /// connection-setup, so a host process rotating the file is picked
+    /// up on the next request without restarting the sandbox.
+    ///
     /// ```ignore
     /// .secret_env("OPENAI_API_KEY", api_key, "api.openai.com")
+    /// .secret_env("ANTHROPIC_TOKEN", PathBuf::from("/tmp/anthropic.token"), "api.anthropic.com")
     /// ```
     #[cfg(feature = "net")]
     pub fn secret_env(
         self,
         env_var: impl Into<String>,
-        value: impl Into<String>,
+        value: impl Into<microsandbox_network::secrets::config::SecretValue>,
         allowed_host: impl Into<String>,
     ) -> Self {
         let env_var = env_var.into();

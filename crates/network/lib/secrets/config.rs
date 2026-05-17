@@ -1,5 +1,7 @@
 //! Secret injection configuration types.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 //--------------------------------------------------------------------------------------------------
@@ -18,6 +20,71 @@ pub struct SecretsConfig {
     pub on_violation: ViolationAction,
 }
 
+/// Source for a secret's real value. The value never enters the sandbox.
+///
+/// `Static` captures the bytes at builder time; `File` re-reads the host
+/// file at *connection-setup* time, allowing the value to change over the
+/// lifetime of the running sandbox (e.g. a host-side credential file
+/// rotated by another process). The connection-scoped caching means a
+/// single in-flight request always sees a consistent value even if the
+/// file changes mid-stream.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum SecretValue {
+    /// Literal value captured at builder time.
+    Static(String),
+    /// Path to a host file whose contents (trailing whitespace trimmed)
+    /// are read on each new connection that matches this secret. Reads
+    /// happen on the host's filesystem and never enter the sandbox.
+    File(PathBuf),
+}
+
+impl SecretValue {
+    /// Resolve to the current secret bytes. For `Static` returns the
+    /// captured string verbatim; for `File` reads from disk and trims
+    /// trailing ASCII whitespace (a `\n` from editors is the common
+    /// case).
+    pub fn resolve(&self) -> std::io::Result<String> {
+        match self {
+            SecretValue::Static(s) => Ok(s.clone()),
+            SecretValue::File(p) => {
+                let mut s = std::fs::read_to_string(p)?;
+                while matches!(s.as_bytes().last(), Some(b) if b.is_ascii_whitespace()) {
+                    s.pop();
+                }
+                Ok(s)
+            }
+        }
+    }
+}
+
+impl From<String> for SecretValue {
+    fn from(s: String) -> Self {
+        SecretValue::Static(s)
+    }
+}
+
+impl From<&str> for SecretValue {
+    fn from(s: &str) -> Self {
+        SecretValue::Static(s.to_string())
+    }
+}
+
+impl From<PathBuf> for SecretValue {
+    fn from(p: PathBuf) -> Self {
+        SecretValue::File(p)
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretValue::Static(_) => f.write_str("SecretValue::Static([REDACTED])"),
+            SecretValue::File(p) => write!(f, "SecretValue::File({})", p.display()),
+        }
+    }
+}
+
 /// A single secret entry (serializable form passed to the network engine).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SecretEntry {
@@ -25,7 +92,7 @@ pub struct SecretEntry {
     pub env_var: String,
 
     /// The actual secret value (never enters the sandbox).
-    pub value: String,
+    pub value: SecretValue,
 
     /// Placeholder string the sandbox sees instead of the real value.
     pub placeholder: String,
@@ -195,12 +262,41 @@ mod tests {
     fn default_require_tls_identity() {
         let entry = SecretEntry {
             env_var: "K".into(),
-            value: "v".into(),
+            value: SecretValue::Static("v".into()),
             placeholder: "$K".into(),
             allowed_hosts: vec![],
             injection: SecretInjection::default(),
             require_tls_identity: true,
         };
         assert!(entry.require_tls_identity);
+    }
+
+    #[test]
+    fn secret_value_static_resolves() {
+        let v = SecretValue::Static("hello".to_string());
+        assert_eq!(v.resolve().unwrap(), "hello");
+    }
+
+    #[test]
+    fn secret_value_file_resolves_and_trims() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        write!(f, "secret-token\n").unwrap();
+        let v = SecretValue::File(f.path().to_path_buf());
+        assert_eq!(v.resolve().unwrap(), "secret-token");
+    }
+
+    #[test]
+    fn secret_value_file_missing_is_error() {
+        let v = SecretValue::File("/definitely/not/here".into());
+        assert!(v.resolve().is_err());
+    }
+
+    #[test]
+    fn secret_value_debug_redacts_static_but_shows_path() {
+        let s = SecretValue::Static("topsecret".to_string());
+        assert!(!format!("{s:?}").contains("topsecret"));
+        let f = SecretValue::File("/etc/foo".into());
+        assert!(format!("{f:?}").contains("/etc/foo"));
     }
 }

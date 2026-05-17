@@ -2753,6 +2753,7 @@ dependencies = [
  "smoltcp",
  "socket2 0.5.10",
  "system-configuration",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
