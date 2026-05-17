@@ -385,14 +385,15 @@ async fn forward_plaintext(
             Err(e) => return Err(e),
         };
 
-        // Substitution first (so the interceptor sees post-substitution
+        // Substitution first (the interceptor sees post-substitution
         // bytes — its hook subprocess receives the same request body
-        // that the upstream server would have).
-        let substituted: Vec<u8> = if secrets_handler.is_empty() {
-            buf[..n].to_vec()
+        // that the upstream server would have). Stay zero-copy on the
+        // common no-secrets path via Cow::Borrowed.
+        let substituted: std::borrow::Cow<'_, [u8]> = if secrets_handler.is_empty() {
+            std::borrow::Cow::Borrowed(&buf[..n])
         } else {
             match secrets_handler.substitute(&buf[..n]) {
-                Some(data) => data.into_owned(),
+                Some(data) => data,
                 None => {
                     if secrets_handler.terminates_on_violation() {
                         shared.trigger_termination();
@@ -407,7 +408,10 @@ async fn forward_plaintext(
 
         if let Some(intercept) = interceptor.as_deref_mut() {
             match intercept.process_chunk(&substituted).await? {
-                Verdict::Forward(data) => server_tls.write_all(&data).await?,
+                Verdict::Forward => server_tls.write_all(&substituted).await?,
+                Verdict::ForwardBuffered(buffered) => {
+                    server_tls.write_all(&buffered).await?;
+                }
                 Verdict::Hold => continue,
                 Verdict::Intercept(response) => {
                     guest_tls

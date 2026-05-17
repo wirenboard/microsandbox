@@ -26,10 +26,13 @@ use super::config::{InterceptConfig, InterceptRule};
 
 /// What the proxy should do with the chunk it just fed in.
 pub enum Verdict {
-    /// Forward `bytes` to the upstream server (the proxy's existing
-    /// path). May be the original chunk or — in the future — a
-    /// rewritten one; today this just echoes the input.
-    Forward(Vec<u8>),
+    /// Forward the chunk the caller already has — zero-copy hot path.
+    Forward,
+    /// We had previously held bytes (in `Buffering`) and now must
+    /// flush them as a single upstream write so the request reaches
+    /// the server reassembled. Includes the held bytes plus the
+    /// current chunk. Used only on the rare overflow fallback path.
+    ForwardBuffered(Vec<u8>),
     /// Hold this chunk; the interceptor is still accumulating bytes
     /// and will decide what to do later. The proxy should not touch
     /// the upstream server with this chunk.
@@ -80,7 +83,7 @@ impl Interceptor {
     pub async fn process_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Verdict> {
         match &mut self.state {
             State::Pristine => self.process_first_chunk(chunk).await,
-            State::Forwarding | State::Disabled => Ok(Verdict::Forward(chunk.to_vec())),
+            State::Forwarding | State::Disabled => Ok(Verdict::Forward),
             State::Buffering { .. } => self.process_buffer_chunk(chunk).await,
         }
     }
@@ -88,7 +91,7 @@ impl Interceptor {
     async fn process_first_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Verdict> {
         if !self.config.is_active() {
             self.state = State::Forwarding;
-            return Ok(Verdict::Forward(chunk.to_vec()));
+            return Ok(Verdict::Forward);
         }
 
         // Need at least one line + the `\r\n` separator to parse the
@@ -97,18 +100,18 @@ impl Interceptor {
         // plaintext chunk every time).
         let Some(eol) = find_subsequence(chunk, b"\r\n") else {
             self.state = State::Forwarding;
-            return Ok(Verdict::Forward(chunk.to_vec()));
+            return Ok(Verdict::Forward);
         };
         let request_line = std::str::from_utf8(&chunk[..eol]).unwrap_or("");
 
         let Some((method, path)) = parse_request_line(request_line) else {
             self.state = State::Forwarding;
-            return Ok(Verdict::Forward(chunk.to_vec()));
+            return Ok(Verdict::Forward);
         };
 
         let Some(rule) = self.find_matching_rule(method, path) else {
             self.state = State::Forwarding;
-            return Ok(Verdict::Forward(chunk.to_vec()));
+            return Ok(Verdict::Forward);
         };
         let rule = rule.clone();
 
@@ -159,7 +162,7 @@ impl Interceptor {
                 let mut to_forward = std::mem::take(accumulated);
                 to_forward.extend_from_slice(chunk);
                 self.state = State::Disabled;
-                return Ok(Verdict::Forward(to_forward));
+                return Ok(Verdict::ForwardBuffered(to_forward));
             }
             accumulated.extend_from_slice(chunk);
         }
@@ -324,7 +327,7 @@ mod tests {
     async fn forwards_when_no_rules() {
         let mut i = Interceptor::new(InterceptConfig::default(), "example.com");
         let v = i.process_chunk(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-        assert!(matches!(v, Verdict::Forward(_)));
+        assert!(matches!(v, Verdict::Forward));
     }
 
     #[tokio::test]
@@ -341,7 +344,7 @@ mod tests {
             .process_chunk(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
             .await
             .unwrap();
-        assert!(matches!(v, Verdict::Forward(_)));
+        assert!(matches!(v, Verdict::Forward));
     }
 
     #[tokio::test]
