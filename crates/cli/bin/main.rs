@@ -20,7 +20,12 @@ use microsandbox_cli::{
 #[derive(Parser)]
 #[command(
     name = "msb",
-    version,
+    // Suffix marks this as a fork carrying agent-vm's Phase 4 patches
+    // (SecretValue::File + request-interceptor hook). Keeping the
+    // version-number prefix unchanged means the build-script's
+    // GitHub-release URL derivation still resolves; only --version
+    // output and `Cli::version()` callers see the suffix.
+    version = concat!(env!("CARGO_PKG_VERSION"), "+agent-vm.phase4"),
     about = format!("Microsandbox CLI v{}", env!("CARGO_PKG_VERSION")),
     styles = microsandbox_cli::styles::styles()
 )]
