@@ -9,6 +9,7 @@ use ipnetwork::{Ipv4Network, Ipv6Network};
 
 use crate::config::{DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort};
 use crate::dns::Nameserver;
+use crate::intercept::config::{InterceptConfig, InterceptRule};
 use crate::policy::{BuildError, NetworkPolicy};
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretValue, ViolationAction,
@@ -192,6 +193,32 @@ impl NetworkBuilder {
     /// Set the violation action for secrets.
     pub fn on_secret_violation(mut self, action: ViolationAction) -> Self {
         self.config.secrets.on_violation = action;
+        self
+    }
+
+    /// Configure the request-interceptor hook.
+    ///
+    /// `hook` is the subprocess command (argv vector) invoked when a
+    /// matched intercepted request is fully buffered. The hook
+    /// receives the request bytes on stdin and is expected to write a
+    /// complete HTTP response on stdout. Environment variables
+    /// `MSB_INTERCEPT_SNI`, `MSB_INTERCEPT_HOST_RULE`,
+    /// `MSB_INTERCEPT_METHOD`, `MSB_INTERCEPT_PATH_PREFIX` are set
+    /// per invocation so the hook can decide what to do without
+    /// re-parsing the request line.
+    ///
+    /// Each `rule(host, method, path_prefix)` call adds one route to
+    /// the match set. Rules are AND-matched (host + method +
+    /// path_prefix all must hold) and the first matching rule fires.
+    ///
+    /// ```ignore
+    /// .intercept(|i| i
+    ///     .hook(["/usr/local/bin/agent-vm", "intercept-hook"])
+    ///     .rule("platform.claude.com", "POST", "/v1/oauth/token")
+    ///     .rule("auth.openai.com",     "POST", "/oauth/token"))
+    /// ```
+    pub fn intercept(mut self, f: impl FnOnce(InterceptBuilder) -> InterceptBuilder) -> Self {
+        self.config.intercept = f(InterceptBuilder::default()).build();
         self
     }
 
@@ -476,6 +503,51 @@ impl SecretBuilder {
             injection: self.injection,
             require_tls_identity: self.require_tls_identity,
         }
+    }
+}
+
+/// Fluent builder for [`InterceptConfig`].
+#[derive(Default)]
+pub struct InterceptBuilder {
+    config: InterceptConfig,
+}
+
+impl InterceptBuilder {
+    /// Set the hook command (argv vector). Required for the
+    /// interceptor to fire — without it the config stays inert.
+    pub fn hook<I, S>(mut self, hook: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.hook = Some(hook.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Add one match rule. Multiple calls accumulate.
+    pub fn rule(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+        });
+        self
+    }
+
+    /// Override the per-request buffer ceiling (default 64 KiB).
+    pub fn max_request_bytes(mut self, n: usize) -> Self {
+        self.config.max_request_bytes = n;
+        self
+    }
+
+    /// Consume and return the configured [`InterceptConfig`].
+    pub fn build(self) -> InterceptConfig {
+        self.config
     }
 }
 

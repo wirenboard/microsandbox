@@ -33,6 +33,8 @@ pub struct TlsState {
     pub config: TlsConfig,
     /// Secrets configuration for placeholder substitution.
     pub secrets: SecretsConfig,
+    /// Interceptor configuration (Phase 4: OAuth refresh MITM).
+    pub intercept: crate::intercept::config::InterceptConfig,
     /// Pre-computed lowercased bypass patterns for efficient matching.
     bypass_patterns: Vec<BypassPattern>,
 }
@@ -62,7 +64,11 @@ impl TlsState {
     /// 1. User-provided paths (`config.intercept_ca.cert_path` + `config.intercept_ca.key_path`)
     /// 2. Default persistence path (`~/.microsandbox/tls/ca.{crt,key}`)
     /// 3. Auto-generate and persist to default path
-    pub fn new(config: TlsConfig, secrets: SecretsConfig) -> Self {
+    pub fn new(
+        config: TlsConfig,
+        secrets: SecretsConfig,
+        intercept: crate::intercept::config::InterceptConfig,
+    ) -> Self {
         let ca = load_or_generate_ca(&config);
 
         let capacity =
@@ -95,6 +101,7 @@ impl TlsState {
             connector,
             config,
             secrets,
+            intercept,
             bypass_patterns,
         }
     }
