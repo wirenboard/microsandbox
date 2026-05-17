@@ -227,6 +227,29 @@ impl SecretsHandler {
             return Some(Cow::Borrowed(data));
         }
 
+        // Second fast path: if no eligible placeholder actually appears
+        // anywhere in the chunk, substitution is a no-op anyway. Return
+        // the bytes unchanged. This protects post-WebSocket-upgrade
+        // binary frames, server-side chunked-body continuations, and
+        // any other non-HTTP plaintext from the lossy UTF-8 round trip
+        // below that would otherwise mangle non-UTF-8 bytes.
+        //
+        // Doesn't apply when any eligible secret enables `inject_basic_auth`,
+        // because Basic credentials are base64-encoded — the placeholder
+        // only appears after decoding, not in the raw bytes.
+        let any_basic_auth = self.eligible.iter().any(|s| {
+            !(s.require_tls_identity && !self.tls_intercepted) && s.inject_basic_auth
+        });
+        if !any_basic_auth {
+            let any_eligible_placeholder_present = self.eligible.iter().any(|s| {
+                !(s.require_tls_identity && !self.tls_intercepted)
+                    && byte_contains(data, s.placeholder.as_bytes())
+            });
+            if !any_eligible_placeholder_present {
+                return Some(Cow::Borrowed(data));
+            }
+        }
+
         // Whether any eligible secret wants the body inspected. If none
         // do (the default for header-only Bearer substitution), we
         // pass the body bytes through untouched — avoids a UTF-8 lossy
@@ -468,6 +491,12 @@ fn find_header_boundary(data: &[u8]) -> Option<usize> {
     data.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|pos| pos + 4)
+}
+
+/// Substring search on raw bytes. Used for placeholder presence
+/// checks where allocating a String would defeat the purpose.
+fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 //--------------------------------------------------------------------------------------------------
