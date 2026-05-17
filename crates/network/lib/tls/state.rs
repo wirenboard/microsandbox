@@ -250,6 +250,16 @@ fn build_upstream_connector(config: &TlsConfig) -> TlsConnector {
             .with_no_client_auth()
     };
 
+    // The substitute() / interceptor path is HTTP/1.1-aware only
+    // (splits on \r\n). Explicitly advertise http/1.1 in upstream
+    // ALPN so the real server never tries to switch us to HTTP/2 or
+    // h3 mid-handshake. Without this the negotiation depends on
+    // whatever rustls defaults to per-connection and a server
+    // pinning h2 (chatgpt.com does) would force us into a protocol
+    // the proxy can't parse correctly.
+    let mut client_config = client_config;
+    client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
     TlsConnector::from(Arc::new(client_config))
 }
 

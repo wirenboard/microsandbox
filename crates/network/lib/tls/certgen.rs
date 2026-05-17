@@ -43,10 +43,15 @@ pub fn generate_domain_cert(domain: &str, ca: &CertAuthority, validity_hours: u6
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
     // Pre-build ServerConfig so it can be reused across connections to the same domain.
-    let server_config = rustls::ServerConfig::builder()
+    let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain.clone(), key.clone_key())
         .expect("failed to build ServerConfig for domain cert");
+    // Mirror the upstream connector: HTTP/1.1 only. Without this we
+    // implicitly accept whatever the guest's TLS client advertises
+    // (e.g. h2 first), and our HTTP-parsing proxy can't handle
+    // anything other than http/1.1.
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     DomainCert {
         chain,

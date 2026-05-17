@@ -198,12 +198,10 @@ impl SecretsHandler {
             Some(pos) => (&data[..pos], &data[pos..]),
             None => (data, &[] as &[u8]),
         };
+        // Header strings are always ASCII per HTTP spec; lossy conversion
+        // is a no-op for valid HTTP and a benign byte-replacement for
+        // junk we wouldn't have substituted into anyway.
         let mut header_str = String::from_utf8_lossy(header_bytes).into_owned();
-        let mut body_str = if boundary.is_some() {
-            String::from_utf8_lossy(body_bytes).into_owned()
-        } else {
-            String::new()
-        };
 
         // Fast path: skip violation check when no ineligible secrets exist.
         if self.has_ineligible && self.has_violation(data, &header_str) {
@@ -229,27 +227,54 @@ impl SecretsHandler {
             return Some(Cow::Borrowed(data));
         }
 
+        // Whether any eligible secret wants the body inspected. If none
+        // do (the default for header-only Bearer substitution), we
+        // pass the body bytes through untouched — avoids a UTF-8 lossy
+        // round-trip that would corrupt non-UTF-8 payloads (binary
+        // multipart, compressed bodies, etc.).
+        let body_substitution_active = self.eligible.iter().any(|s| {
+            !(s.require_tls_identity && !self.tls_intercepted) && s.inject_body
+        });
+
+        let mut new_body: Option<String> = None;
+        if body_substitution_active && boundary.is_some() {
+            let mut body_str = String::from_utf8_lossy(body_bytes).into_owned();
+            for secret in &self.eligible {
+                if secret.require_tls_identity && !self.tls_intercepted {
+                    continue;
+                }
+                if secret.inject_body && body_str.contains(&secret.placeholder) {
+                    body_str = body_str.replace(&secret.placeholder, &secret.value);
+                }
+            }
+            new_body = Some(body_str);
+        }
+
         for secret in &self.eligible {
-            // Skip secrets that require TLS identity on non-intercepted connections.
             if secret.require_tls_identity && !self.tls_intercepted {
                 continue;
             }
             if secret.wants_header_injection() {
                 header_str = secret.substitute_in_headers(&header_str);
             }
-            if boundary.is_some() && secret.inject_body && body_str.contains(&secret.placeholder) {
-                body_str = body_str.replace(&secret.placeholder, &secret.value);
-            }
         }
 
         // If body substitution changed the length, update Content-Length.
-        if boundary.is_some() && body_str.len() != body_bytes.len() {
-            header_str = update_content_length(&header_str, body_str.len());
+        let body_len_for_header = new_body.as_ref().map(|b| b.len()).unwrap_or(body_bytes.len());
+        if boundary.is_some() && body_len_for_header != body_bytes.len() {
+            header_str = update_content_length(&header_str, body_len_for_header);
         }
 
-        let mut output = header_str;
-        output.push_str(&body_str);
-        Some(Cow::Owned(output.into_bytes()))
+        // Reassemble. Pass body bytes through verbatim unless we
+        // actually rewrote them.
+        let header_bytes = header_str.into_bytes();
+        let mut output = Vec::with_capacity(header_bytes.len() + body_len_for_header);
+        output.extend_from_slice(&header_bytes);
+        match new_body {
+            Some(b) => output.extend_from_slice(b.as_bytes()),
+            None => output.extend_from_slice(body_bytes),
+        }
+        Some(Cow::Owned(output))
     }
 
     /// Returns true if no secrets are configured.
