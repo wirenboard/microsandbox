@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -28,8 +28,23 @@ pub struct SecretsConfig {
 /// rotated by another process). The connection-scoped caching means a
 /// single in-flight request always sees a consistent value even if the
 /// file changes mid-stream.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value")]
+///
+/// ## Wire format
+///
+/// The on-the-wire form is a single string so the network engine's
+/// serialized [`crate::config::NetworkConfig`] stays backward-compatible
+/// with a `msb` daemon built before this enum existed:
+///
+/// - `Static(v)`        ↔ `v`                                (bare string)
+/// - `File(p)`          ↔ `"\0msbfile:<path>"`               (NUL-prefixed sentinel)
+///
+/// API tokens are always printable ASCII, so the NUL prefix can't collide
+/// with a legitimate static value. Old daemons that don't recognise the
+/// sentinel will treat the whole string (including the NUL) as a static
+/// value and substitute it verbatim — broken for `File`, but never
+/// crashes. Phase 3 of agent-vm uses only `Static`, so the path stays
+/// fully compatible until we ship a daemon that understands the sentinel.
+#[derive(Clone)]
 pub enum SecretValue {
     /// Literal value captured at builder time.
     Static(String),
@@ -38,6 +53,8 @@ pub enum SecretValue {
     /// happen on the host's filesystem and never enter the sandbox.
     File(PathBuf),
 }
+
+const FILE_SENTINEL_PREFIX: &str = "\0msbfile:";
 
 impl SecretValue {
     /// Resolve to the current secret bytes. For `Static` returns the
@@ -81,6 +98,29 @@ impl std::fmt::Debug for SecretValue {
         match self {
             SecretValue::Static(_) => f.write_str("SecretValue::Static([REDACTED])"),
             SecretValue::File(p) => write!(f, "SecretValue::File({})", p.display()),
+        }
+    }
+}
+
+impl Serialize for SecretValue {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SecretValue::Static(v) => ser.serialize_str(v),
+            SecretValue::File(p) => {
+                let encoded = format!("{FILE_SENTINEL_PREFIX}{}", p.display());
+                ser.serialize_str(&encoded)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretValue {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        if let Some(rest) = s.strip_prefix(FILE_SENTINEL_PREFIX) {
+            Ok(SecretValue::File(PathBuf::from(rest)))
+        } else {
+            Ok(SecretValue::Static(s))
         }
     }
 }
@@ -298,5 +338,30 @@ mod tests {
         assert!(!format!("{s:?}").contains("topsecret"));
         let f = SecretValue::File("/etc/foo".into());
         assert!(format!("{f:?}").contains("/etc/foo"));
+    }
+
+    #[test]
+    fn secret_value_static_wire_format_is_bare_string() {
+        // Backward compat with `value: String` daemons. The serialized
+        // form must be JSON's "hello", not a tagged map.
+        let s = SecretValue::Static("hello".into());
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, "\"hello\"");
+    }
+
+    #[test]
+    fn secret_value_file_wire_format_uses_sentinel() {
+        let s = SecretValue::File("/tmp/tok".into());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("msbfile:/tmp/tok"));
+        // Round-trips back to File.
+        let round: SecretValue = serde_json::from_str(&json).unwrap();
+        assert!(matches!(round, SecretValue::File(p) if p == PathBuf::from("/tmp/tok")));
+    }
+
+    #[test]
+    fn secret_value_bare_string_deserializes_to_static() {
+        let s: SecretValue = serde_json::from_str("\"plain-token\"").unwrap();
+        assert!(matches!(s, SecretValue::Static(v) if v == "plain-token"));
     }
 }
