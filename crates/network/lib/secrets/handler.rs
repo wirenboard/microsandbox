@@ -35,6 +35,18 @@ pub struct SecretsHandler {
     /// placeholder split across TCP writes still trips the violation check.
     /// Capped at `max_placeholder_len - 1` bytes.
     prev_tail: Vec<u8>,
+    /// Set to true once we've seen `\r\n\r\n` on this stream. Used by the
+    /// body-only fast path to safely distinguish "this chunk is body
+    /// continuation" from "this chunk is partial headers (no boundary yet)".
+    /// Without this, a chunk that happens to contain a placeholder in
+    /// partial headers would be returned verbatim, leaking the placeholder.
+    ///
+    /// Limitation: with HTTP/1.1 pipelining (multiple requests on one
+    /// connection) this flag stays true between requests, so the second
+    /// request's partial headers could be skipped. agent-vm clients
+    /// (Anthropic SDK, OpenAI SDK, gh, git) don't pipeline; for general
+    /// use, a Content-Length-aware reset would be needed.
+    headers_terminator_seen: bool,
 }
 
 /// A secret that passed host matching for this connection.
@@ -177,6 +189,7 @@ impl SecretsHandler {
             tls_intercepted,
             max_placeholder_len,
             prev_tail: Vec::new(),
+            headers_terminator_seen: false,
         }
     }
 
@@ -250,33 +263,41 @@ impl SecretsHandler {
             }
         }
 
-        // Third fast path: this chunk is a pure body continuation (no
-        // `\r\n\r\n` header boundary visible) AND no eligible secret
-        // wants `inject_body`. Header substitution can't possibly fire
-        // because there's no header line in this chunk; running the
-        // slow path anyway would still UTF-8 round-trip the bytes via
-        // `from_utf8_lossy`, and any chunk boundary that falls in the
-        // middle of a multi-byte UTF-8 character would silently grow
-        // the chunk (orphan continuation bytes become U+FFFD = 3 bytes
-        // each) — without a Content-Length adjustment, the receiver
-        // either reads short of the original body or truncates real
-        // data. This triggered when an HTTP body legitimately
-        // mentioned a placeholder string in its content (e.g. an LLM
-        // chat about agent-vm itself).
+        // Track that we've seen the header terminator on this stream.
+        // The body-only fast path below depends on this to distinguish
+        // "this chunk is body continuation" from "this chunk is partial
+        // headers, full request not yet received".
+        if boundary.is_some() {
+            self.headers_terminator_seen = true;
+        }
+
+        // Third fast path: this chunk is a pure body continuation. We
+        // can prove that by (a) no `\r\n\r\n` boundary in this chunk
+        // AND (b) we've already seen one earlier on this stream — so
+        // this MUST be body bytes, not partial headers of the first
+        // request.
         //
-        // Only honour the fast path when the placeholder match is
-        // strictly in the body region. We can tell because `boundary`
-        // is `None` AND we're here despite the second fast path —
-        // i.e. a placeholder substring DID appear, but only in
-        // body-shaped bytes.
+        // Combined with (c) no eligible secret wanting `inject_body`,
+        // we can skip the slow path entirely. The slow path's
+        // `from_utf8_lossy` on the whole chunk would otherwise mangle
+        // bytes at any chunk boundary cut in the middle of a
+        // multi-byte UTF-8 character (orphans → U+FFFD = 3 bytes
+        // each), silently growing the chunk without updating
+        // Content-Length and causing the receiver to truncate real
+        // data at the original length mark.
+        //
+        // The boundary.is_none() alone is not sufficient: if the very
+        // first chunk of a request hasn't reached `\r\n\r\n` yet
+        // (large headers split across reads), a placeholder sitting
+        // in partial headers would be skipped. The
+        // `headers_terminator_seen` gate prevents that.
         let body_substitution_wanted = self.eligible.iter().any(|s| {
             !(s.require_tls_identity && !self.tls_intercepted) && s.inject_body
         });
-        if boundary.is_none() && !body_substitution_wanted {
+        if self.headers_terminator_seen && boundary.is_none() && !body_substitution_wanted {
             return Some(Cow::Borrowed(data));
         }
 
-        // (`body_substitution_wanted` computed above.)
         let body_substitution_active = body_substitution_wanted;
 
         let mut new_body: Option<String> = None;
@@ -583,6 +604,11 @@ mod tests {
         let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
         let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
 
+        // First, send a chunk that establishes "we've seen the header
+        // terminator on this stream" so subsequent body-only chunks
+        // get the fast path.
+        let _ = handler.substitute(b"POST /v1/x HTTP/1.1\r\nContent-Length: 999\r\n\r\n");
+
         // Body bytes: a JSON-like payload that legitimately mentions
         // the placeholder name as content, AND contains a multi-byte
         // UTF-8 char (€ = E2 82 AC). No `\r\n\r\n` boundary in this
@@ -607,6 +633,7 @@ mod tests {
     fn body_only_chunk_split_mid_utf8_is_not_round_tripped() {
         let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
         let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+        let _ = handler.substitute(b"POST /v1/x HTTP/1.1\r\nContent-Length: 9999\r\n\r\n");
 
         // "€" = E2 82 AC. Split between E2 and the rest.
         let mut input = b"abc $KEY def \xE2".to_vec(); // ends with the high byte of €
@@ -619,6 +646,32 @@ mod tests {
         let original2 = input.clone();
         let output2 = handler.substitute(&input).unwrap();
         assert_eq!(&*output2, original2.as_slice());
+    }
+
+    /// Regression: a chunk with NO `\r\n\r\n` boundary at the very
+    /// start of a stream (no prior chunk seen → headers_terminator_seen
+    /// is false) must NOT take the body-only fast path, because the
+    /// chunk could be partial headers carrying a placeholder. The
+    /// previous fix gated only on `boundary.is_none()` and would
+    /// silently leak a placeholder sitting in a header line that
+    /// happened to fall in the first chunk before the headers
+    /// terminator was reached.
+    #[test]
+    fn partial_headers_chunk_with_placeholder_still_substitutes() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+
+        // First chunk of a request whose headers haven't reached
+        // \r\n\r\n yet. Contains the placeholder in an Authorization
+        // header that NEEDS to be substituted.
+        let input = b"POST /v1/x HTTP/1.1\r\nAuthorization: Bearer $KEY\r\nUser-Agent: very-long-padding-".to_vec();
+        let output = handler.substitute(&input).unwrap();
+        let s = String::from_utf8(output.into_owned()).unwrap();
+        assert!(
+            s.contains("Authorization: Bearer real-secret"),
+            "placeholder MUST be substituted in partial-headers chunk; got: {s}"
+        );
+        assert!(!s.contains("$KEY"), "placeholder must not survive: {s}");
     }
 
     #[test]
