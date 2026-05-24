@@ -145,6 +145,13 @@ pub struct SandboxArgs {
 
 /// Run the sandbox process. This function **never returns**.
 pub fn run(args: SandboxArgs, log_level: Option<LogLevel>) -> ! {
+    // Make the panic hook (installed in main, before args were
+    // parsed) write directly to runtime.log on a future panic. The
+    // in-process pipe→thread that normally captures stderr can lose
+    // the panic line on abort(); this side-channel is synchronous
+    // and survives.
+    crate::ui::set_sandbox_log_path(args.log_dir.join("runtime.log"));
+
     let is_vmdk = args.rootfs_disk_format.as_deref() == Some("vmdk");
     let vm_config = VmConfig {
         libkrunfw_path: args.libkrunfw_path,

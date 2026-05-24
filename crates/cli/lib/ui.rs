@@ -255,8 +255,35 @@ pub fn install_panic_hook() {
                 }
             }
         }
+        // For `msb sandbox` subprocesses, also append the panic to
+        // runtime.log directly. The sandbox redirects its own stderr
+        // into runtime.log via an in-process pipe→thread; on abort()
+        // that thread dies before draining the last few bytes, so
+        // panic messages routinely fail to land. Writing the file
+        // directly here is synchronous and survives the abort,
+        // ensuring the parent's wait_for_relay tail can surface a
+        // real cause to the user.
+        if let Some(path) = SANDBOX_LOG_PATH.get() {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "\n{info}");
+            }
+        }
         default(info);
     }));
+}
+
+/// Set by `msb sandbox` after parsing `--log-dir` so the panic hook
+/// (installed earlier in main, before args were available) can append
+/// to runtime.log directly. See [`install_panic_hook`].
+static SANDBOX_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_sandbox_log_path(path: std::path::PathBuf) {
+    let _ = SANDBOX_LOG_PATH.set(path);
 }
 
 /// Print a styled error message to stderr.
