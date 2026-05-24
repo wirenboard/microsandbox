@@ -47,6 +47,11 @@ pub struct SecretsHandler {
     /// (Anthropic SDK, OpenAI SDK, gh, git) don't pipeline; for general
     /// use, a Content-Length-aware reset would be needed.
     headers_terminator_seen: bool,
+    /// SNI / destination host this handler was created for. Surfaced
+    /// in the violation log so a "secret violation" line names which
+    /// destination tripped — without it the warn is anonymous and
+    /// can't be matched to a conn during diagnosis.
+    sni: String,
 }
 
 /// A secret that passed host matching for this connection.
@@ -190,6 +195,7 @@ impl SecretsHandler {
             max_placeholder_len,
             prev_tail: Vec::new(),
             headers_terminator_seen: false,
+            sni: sni.to_string(),
         }
     }
 
@@ -217,23 +223,68 @@ impl SecretsHandler {
         let mut header_str = String::from_utf8_lossy(header_bytes).into_owned();
 
         // Fast path: skip violation check when no ineligible secrets exist.
-        if self.has_ineligible && self.has_violation(data, &header_str) {
-            self.update_tail(data);
-            match self.on_violation {
-                ViolationAction::Block => return None,
-                ViolationAction::BlockAndLog => {
-                    tracing::warn!("secret violation: placeholder detected for disallowed host");
-                    return None;
-                }
-                ViolationAction::BlockAndTerminate => {
-                    tracing::error!(
-                        "secret violation: placeholder detected for disallowed host — terminating"
-                    );
-                    return None;
+        if self.has_ineligible {
+            // Scan ONLY the header portion of this chunk. Body bytes are
+            // user content (chat prompts, code, quoted logs) and may
+            // legitimately contain literal `MSB_PLACEHOLDER_*` strings;
+            // blocking on those mid-upload surfaces to the guest as
+            // ECONNRESET and breaks long sessions. Body-continuation
+            // chunks (boundary already seen on this stream, none in this
+            // chunk) pass an empty slice and skip the scan entirely.
+            let header_scan: &[u8] = if boundary.is_some() {
+                header_bytes
+            } else if self.headers_terminator_seen {
+                &[]
+            } else {
+                // No boundary yet on this stream — the whole chunk is
+                // still (potentially partial) headers.
+                data
+            };
+            // Resolve the violation while only immutably borrowing self,
+            // then drop that borrow before any mutating call (update_tail).
+            let violation = self
+                .first_violation(header_scan, &header_str)
+                .map(|(p, k)| (p.to_string(), k));
+            // Update the tail-sliding window with the same header
+            // scope. Once we've crossed into body, header_scan is
+            // empty so prev_tail naturally drains — body bytes never
+            // stitch into a future scan.
+            self.update_tail(header_scan);
+            if let Some((placeholder, match_kind)) = violation {
+                // Capture which placeholder and via which encoding so
+                // the warn is actually useful — distinguishes "GH
+                // token leaking to Anthropic" from "OpenAI placeholder
+                // string quoted in the body". Truncate to a short
+                // prefix to avoid loud lines even though placeholders
+                // aren't themselves secret.
+                let placeholder_label = if placeholder.len() > 48 {
+                    format!("{}…(len {})", &placeholder[..48], placeholder.len())
+                } else {
+                    placeholder.clone()
+                };
+                match self.on_violation {
+                    ViolationAction::Block => return None,
+                    ViolationAction::BlockAndLog => {
+                        tracing::warn!(
+                            sni = %self.sni,
+                            placeholder = %placeholder_label,
+                            match_kind,
+                            "secret violation: placeholder detected for disallowed host"
+                        );
+                        return None;
+                    }
+                    ViolationAction::BlockAndTerminate => {
+                        tracing::error!(
+                            sni = %self.sni,
+                            placeholder = %placeholder_label,
+                            match_kind,
+                            "secret violation: placeholder detected for disallowed host — terminating"
+                        );
+                        return None;
+                    }
                 }
             }
         }
-        self.update_tail(data);
 
         if self.eligible.is_empty() {
             // No substitution needed. Return borrowed slice (zero-copy).
@@ -351,24 +402,55 @@ impl SecretsHandler {
         matches!(self.on_violation, ViolationAction::BlockAndTerminate)
     }
 
-    /// Check if any placeholder appears in data for a host that isn't allowed.
-    /// Scans the raw bytes (stitched with the previous call's tail for
-    /// cross-write detection), plus URL- and JSON-decoded variants for
-    /// encoded-placeholder bypass attempts, plus base64-decoded Basic auth
-    /// credentials.
-    fn has_violation(&self, data: &[u8], headers: &str) -> bool {
+    /// Check if any placeholder appears in this chunk's HEADER region for
+    /// a host that isn't allowed. Body bytes are user-controlled content
+    /// (chat prompts, code, quoted log files) and routinely contain
+    /// placeholder *strings* without meaning a real credential leak —
+    /// blocking on those produces a connection RST mid-upload that the
+    /// guest agent reports as ECONNRESET, breaking long sessions whose
+    /// context happens to mention `MSB_PLACEHOLDER_*`.
+    ///
+    /// The real leak vectors are credential-bearing header positions
+    /// (`Authorization`, `X-*-Key`, URL query params on the request
+    /// line) — all inside the header region. Restricting the scan there
+    /// closes the false-positive class without weakening the actual
+    /// defense.
+    ///
+    /// `header_bytes` is the slice up to and including `\r\n\r\n` on
+    /// chunks where the boundary fell in this chunk, or `data` itself
+    /// on chunks that haven't reached the boundary yet (i.e. still
+    /// pre-body). Pure body-continuation chunks must pass an empty
+    /// slice so this scan does nothing.
+    ///
+    /// Returns `Some((placeholder, match_kind))` for the first hit so
+    /// the caller can log which secret tripped and via which encoding.
+    fn first_violation(
+        &self,
+        header_bytes: &[u8],
+        headers: &str,
+    ) -> Option<(&str, &'static str)> {
         // Fast path: if all placeholders have matching eligible entries, no
         // violation is possible (every secret is allowed for this host).
         if self.eligible.len() == self.all_placeholders.len() {
-            return false;
+            return None;
+        }
+        // Pure body-continuation chunks pass empty header_bytes; nothing
+        // to scan. Also skips the tail-stitching alloc on the hot path.
+        if header_bytes.is_empty() && self.prev_tail.is_empty() {
+            return None;
         }
 
+        // Stitch in prev_tail so a placeholder split across writes is
+        // still detected. We only carry tail for headers, since headers
+        // are now the only thing we scan — that bounds the per-chunk
+        // overhead to a few hundred bytes worst case.
         let scan_buf: Cow<[u8]> = if self.prev_tail.is_empty() {
-            Cow::Borrowed(data)
+            Cow::Borrowed(header_bytes)
         } else {
-            let mut stitched = Vec::with_capacity(self.prev_tail.len() + data.len());
+            let mut stitched =
+                Vec::with_capacity(self.prev_tail.len() + header_bytes.len());
             stitched.extend_from_slice(&self.prev_tail);
-            stitched.extend_from_slice(data);
+            stitched.extend_from_slice(header_bytes);
             Cow::Owned(stitched)
         };
         let scan = scan_buf.as_ref();
@@ -378,16 +460,21 @@ impl SecretsHandler {
                 continue;
             }
             let needle = placeholder.as_bytes();
-            if contains_bytes(scan, needle)
-                || url_decoded_contains(scan, needle)
-                || json_escaped_contains(scan, needle)
-                || basic_auth_decoded_contains(headers, placeholder)
-            {
-                return true;
+            if contains_bytes(scan, needle) {
+                return Some((placeholder.as_str(), "raw"));
+            }
+            if url_decoded_contains(scan, needle) {
+                return Some((placeholder.as_str(), "url_decoded"));
+            }
+            if json_escaped_contains(scan, needle) {
+                return Some((placeholder.as_str(), "json_escaped"));
+            }
+            if basic_auth_decoded_contains(headers, placeholder) {
+                return Some((placeholder.as_str(), "basic_auth_decoded"));
             }
         }
 
-        false
+        None
     }
 
     /// Update the sliding-window tail with the trailing bytes of `data`, so
@@ -889,24 +976,58 @@ mod tests {
         assert!(handler.substitute(input).is_none());
     }
 
+    /// The violation scan deliberately does NOT look inside the body —
+    /// body bytes are user-controlled content (chat prompts, code,
+    /// quoted log files) and routinely contain literal `MSB_PLACEHOLDER_*`
+    /// strings without meaning a real credential leak. Blocking on
+    /// those mid-upload surfaces to the guest as ECONNRESET and breaks
+    /// long sessions. The real leak vectors are credential-bearing
+    /// header positions (Authorization, X-*-Key, URL query params on
+    /// the request line) — all inside the header region, which IS
+    /// still scanned (see `url_encoded_placeholder_in_query_blocks_for_wrong_host`
+    /// and `basic_auth_encoded_placeholder_is_blocked_for_wrong_host`).
     #[test]
-    fn url_encoded_placeholder_in_body_blocks_for_wrong_host() {
+    fn url_encoded_placeholder_in_body_is_not_blocked() {
         let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         let input = b"POST / HTTP/1.1\r\nContent-Length: 13\r\n\r\nkey=%24KEY&x=1";
-        assert!(handler.substitute(input).is_none());
+        assert!(handler.substitute(input).is_some());
     }
 
     #[test]
-    fn json_escaped_placeholder_in_body_blocks_for_wrong_host() {
+    fn json_escaped_placeholder_in_body_is_not_blocked() {
         let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         // `$KEY` is the JSON unicode-escape form of `$KEY`.
         let input =
             b"POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"k\":\"\\u0024KEY\"}";
-        assert!(handler.substitute(input).is_none());
+        assert!(handler.substitute(input).is_some());
+    }
+
+    /// Regression test for the original failure mode: an investigation
+    /// session whose Anthropic POST body contains the literal text of
+    /// *another* secret's placeholder (e.g. an OpenAI placeholder name
+    /// quoted from a jsonl log file) used to trip the body scan and
+    /// drop the conn mid-upload — the guest reported it as ECONNRESET
+    /// and the session retried into a 10-attempt burst. Header-only
+    /// scope means body content like this passes through untouched.
+    #[test]
+    fn ineligible_placeholder_in_body_to_allowed_host_passes_through() {
+        let config = make_config(vec![
+            make_secret("ANTHROPIC_KEY", "real-anthropic-secret", "api.anthropic.com"),
+            make_secret("OPENAI_KEY", "real-openai-secret", "api.openai.com"),
+        ]);
+        let mut handler = SecretsHandler::new(&config, "api.anthropic.com", true);
+
+        // Headers go to the Anthropic API; body quotes the OpenAI
+        // placeholder (e.g. analyzing another session's jsonl).
+        let input =
+            b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 56\r\n\r\n\
+              {\"messages\":[{\"role\":\"user\",\"content\":\"OPENAI_KEY\"}]}";
+        let out = handler.substitute(input).expect("body content is not a leak");
+        assert!(out.windows(b"OPENAI_KEY".len()).any(|w| w == b"OPENAI_KEY"));
     }
 
     #[test]
