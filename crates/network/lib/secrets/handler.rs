@@ -250,14 +250,34 @@ impl SecretsHandler {
             }
         }
 
-        // Whether any eligible secret wants the body inspected. If none
-        // do (the default for header-only Bearer substitution), we
-        // pass the body bytes through untouched — avoids a UTF-8 lossy
-        // round-trip that would corrupt non-UTF-8 payloads (binary
-        // multipart, compressed bodies, etc.).
-        let body_substitution_active = self.eligible.iter().any(|s| {
+        // Third fast path: this chunk is a pure body continuation (no
+        // `\r\n\r\n` header boundary visible) AND no eligible secret
+        // wants `inject_body`. Header substitution can't possibly fire
+        // because there's no header line in this chunk; running the
+        // slow path anyway would still UTF-8 round-trip the bytes via
+        // `from_utf8_lossy`, and any chunk boundary that falls in the
+        // middle of a multi-byte UTF-8 character would silently grow
+        // the chunk (orphan continuation bytes become U+FFFD = 3 bytes
+        // each) — without a Content-Length adjustment, the receiver
+        // either reads short of the original body or truncates real
+        // data. This triggered when an HTTP body legitimately
+        // mentioned a placeholder string in its content (e.g. an LLM
+        // chat about agent-vm itself).
+        //
+        // Only honour the fast path when the placeholder match is
+        // strictly in the body region. We can tell because `boundary`
+        // is `None` AND we're here despite the second fast path —
+        // i.e. a placeholder substring DID appear, but only in
+        // body-shaped bytes.
+        let body_substitution_wanted = self.eligible.iter().any(|s| {
             !(s.require_tls_identity && !self.tls_intercepted) && s.inject_body
         });
+        if boundary.is_none() && !body_substitution_wanted {
+            return Some(Cow::Borrowed(data));
+        }
+
+        // (`body_substitution_wanted` computed above.)
+        let body_substitution_active = body_substitution_wanted;
 
         let mut new_body: Option<String> = None;
         if body_substitution_active && boundary.is_some() {
@@ -546,6 +566,59 @@ mod tests {
             String::from_utf8(output.into_owned()).unwrap(),
             "GET / HTTP/1.1\r\nAuthorization: Bearer real-secret\r\n\r\n"
         );
+    }
+
+    /// Regression: a body-only chunk (no `\r\n\r\n` header boundary)
+    /// that happens to mention the placeholder string in its data
+    /// must NOT be UTF-8 round-tripped. The slow path used to feed
+    /// the whole chunk through `from_utf8_lossy`, and any chunk-
+    /// boundary cut in the middle of a multi-byte UTF-8 char turned
+    /// the orphan bytes into U+FFFD (3 bytes each) — growing the
+    /// body silently with no Content-Length adjustment, causing the
+    /// receiver to truncate real data at the original Content-Length
+    /// mark. Triggered when an LLM body included a literal
+    /// placeholder string (e.g. agent-vm self-discussion).
+    #[test]
+    fn body_only_chunk_with_placeholder_substring_is_not_round_tripped() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+
+        // Body bytes: a JSON-like payload that legitimately mentions
+        // the placeholder name as content, AND contains a multi-byte
+        // UTF-8 char (€ = E2 82 AC). No `\r\n\r\n` boundary in this
+        // chunk (it's a continuation of a previous header chunk).
+        let mut input = b"{\"discussion\":\"the placeholder is $KEY in this codebase\",\"price\":\"".to_vec();
+        input.extend_from_slice("€100".as_bytes());
+        input.extend_from_slice(b"\"}");
+        let original = input.clone();
+
+        let output = handler.substitute(&input).unwrap();
+        // Byte-for-byte identical: the substitution layer must NOT
+        // touch the body when no eligible secret wants body
+        // substitution.
+        assert_eq!(&*output, original.as_slice());
+    }
+
+    /// Same idea but with the chunk boundary deliberately splitting
+    /// a multi-byte UTF-8 character — the failure mode the bug
+    /// triggered in production (chunked 16 KiB reads through 100 KB+
+    /// JSON bodies).
+    #[test]
+    fn body_only_chunk_split_mid_utf8_is_not_round_tripped() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+
+        // "€" = E2 82 AC. Split between E2 and the rest.
+        let mut input = b"abc $KEY def \xE2".to_vec(); // ends with the high byte of €
+        let original = input.clone();
+        let output = handler.substitute(&input).unwrap();
+        assert_eq!(&*output, original.as_slice(), "orphan continuation must survive verbatim");
+
+        // The continuation chunk has the orphan low bytes.
+        input = b"\x82\xAC100".to_vec();
+        let original2 = input.clone();
+        let output2 = handler.substitute(&input).unwrap();
+        assert_eq!(&*output2, original2.as_slice());
     }
 
     #[test]
