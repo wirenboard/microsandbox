@@ -194,28 +194,49 @@ impl Interceptor {
         let bs = body_start.expect("body_start set above");
         let expected = content_length.unwrap_or(0);
         let body_have = accumulated.len().saturating_sub(bs);
-        if body_have < expected {
+
+        // `dispatch_on_headers` rules fire the hook the moment we've
+        // seen the headers — we don't need the body to make a
+        // path-based allow/deny decision and we can't always buffer
+        // it (git push pack data exceeds max_request_bytes by far).
+        // Other rules wait for the full body as before.
+        let dispatch_now = rule.dispatch_on_headers || body_have >= expected;
+        if !dispatch_now {
             return Ok(Verdict::Hold);
         }
 
-        // Full request in `accumulated`. Hand to the hook.
+        // Hand the buffered prefix (headers + whatever body we have so
+        // far) to the hook. For dispatch_on_headers rules this is
+        // usually just the headers; for full-body rules it's the
+        // complete request.
         let request = std::mem::take(accumulated);
+        let rule_clone = rule.clone();
         let response = run_hook(
             self.config
                 .hook
                 .as_ref()
                 .expect("is_active() guarantees hook is Some"),
             &self.sni,
-            rule,
+            &rule_clone,
             &request,
         )
         .await?;
 
-        // Move out of Buffering so subsequent chunks (if any) get
-        // Forwarded.
+        // Move out of Buffering: subsequent chunks (if any) take the
+        // Forwarding path so the network secret-substitution layer
+        // still gets to swap placeholders on streaming body bytes.
         self.state = State::Disabled;
 
-        Ok(Verdict::Intercept(response))
+        // Empty hook stdout signals "passthrough": flush the prefix
+        // we held to upstream verbatim (re-using the existing
+        // ForwardBuffered code path) and let subsequent chunks
+        // continue. Non-empty stdout is the synthesized response
+        // (Intercept), same as before.
+        if response.is_empty() {
+            Ok(Verdict::ForwardBuffered(request))
+        } else {
+            Ok(Verdict::Intercept(response))
+        }
     }
 
     fn find_matching_rule(&self, method: &str, path: &str) -> Option<&InterceptRule> {
@@ -337,6 +358,7 @@ mod tests {
                 host: "platform.claude.com".into(),
                 method: "POST".into(),
                 path_prefix: "/v1/oauth/token".into(),
+                dispatch_on_headers: false,
             }]),
             "example.com",
         );
@@ -356,6 +378,7 @@ mod tests {
                 host: "platform.claude.com".into(),
                 method: "POST".into(),
                 path_prefix: "/v1/oauth/token".into(),
+                dispatch_on_headers: false,
             }]),
             "platform.claude.com",
         );
@@ -380,6 +403,7 @@ mod tests {
                 host: "platform.claude.com".into(),
                 method: "POST".into(),
                 path_prefix: "/v1/oauth/token".into(),
+                dispatch_on_headers: false,
             }]),
             "platform.claude.com",
         );

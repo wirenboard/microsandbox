@@ -37,6 +37,25 @@ pub struct InterceptRule {
     /// Path prefix match. The path portion of the request line
     /// (no query string) must start with this string.
     pub path_prefix: String,
+    /// If true, dispatch the hook as soon as the request **headers**
+    /// are buffered — do NOT wait for the body. Used for path-based
+    /// allow-list / deny-list decisions where the body is irrelevant
+    /// (or too large to fit in `max_request_bytes`, e.g. git push
+    /// pack data).
+    ///
+    /// The hook signals its decision via the **size** of its stdout:
+    /// - **Empty stdout** (zero bytes): passthrough. The proxy
+    ///   flushes the buffered prefix to the upstream server and
+    ///   continues streaming subsequent chunks unchanged (still
+    ///   subject to the network secret-substitution layer).
+    /// - **Non-empty stdout**: same as the normal Intercept verdict
+    ///   — the bytes are returned to the guest as the synthesized
+    ///   HTTP response and the connection closes.
+    ///
+    /// Default `false` preserves the original semantics (wait for
+    /// full body before invoking the hook).
+    #[serde(default)]
+    pub dispatch_on_headers: bool,
 }
 
 fn default_max_request_bytes() -> usize {

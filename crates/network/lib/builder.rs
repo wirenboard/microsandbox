@@ -524,7 +524,9 @@ impl InterceptBuilder {
         self
     }
 
-    /// Add one match rule. Multiple calls accumulate.
+    /// Add one match rule. Multiple calls accumulate. The hook is
+    /// invoked once the *full request body* has been buffered (or the
+    /// per-request cap is hit).
     pub fn rule(
         mut self,
         host: impl Into<String>,
@@ -535,6 +537,30 @@ impl InterceptBuilder {
             host: host.into(),
             method: method.into(),
             path_prefix: path_prefix.into(),
+            dispatch_on_headers: false,
+        });
+        self
+    }
+
+    /// Add a match rule that fires the hook as soon as the request
+    /// **headers** are seen — does NOT wait for the body. Use for
+    /// path-based allow/deny decisions where the body is irrelevant
+    /// (or too large to buffer, e.g. git push pack data).
+    ///
+    /// The hook signals via stdout: empty = passthrough (proxy
+    /// continues streaming, network-secret substitution still applies);
+    /// non-empty = synthesized response (same as `rule()`).
+    pub fn rule_streaming(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            dispatch_on_headers: true,
         });
         self
     }
