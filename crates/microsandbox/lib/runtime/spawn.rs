@@ -149,9 +149,15 @@ pub async fn spawn_sandbox(
         cmd.process_group(0);
     }
 
-    // Capture stdout (for startup JSON), inherit stderr so errors are visible.
+    // Capture stdout (for startup JSON). Pipe stderr through a tee task
+    // so it lands in BOTH the parent's stderr (live) AND a per-sandbox
+    // log file at <log_dir>/msb.stderr.log. The on-disk copy survives
+    // terminal wedges (e.g. attach loop stuck after a VM death) and
+    // gives a post-mortem trail for VMM panics, kernel printks
+    // (OOM-killer), and libkrun device errors that the in-process log
+    // capture sometimes misses on SIGABRT. Truncated on each spawn.
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
 
     // Spawn the sandbox process.
     let mut child = cmd.spawn()?;
@@ -160,6 +166,61 @@ pub async fn spawn_sandbox(
         crate::MicrosandboxError::Runtime("sandbox process exited immediately".into())
     })?;
     tracing::debug!(pid = _pid, sandbox = %config.name, "spawn_sandbox: process started");
+
+    // Tee msb's stderr → host stderr + <log_dir>/msb.stderr.log. The
+    // task ends when the child closes stderr (i.e. exits). Errors
+    // opening the file are logged but don't fail the spawn — we'd
+    // rather boot without disk-side capture than refuse to launch.
+    if let Some(stderr) = child.stderr.take() {
+        let stderr_log_path = log_dir.join("msb.stderr.log");
+        let sandbox_name = config.name.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut file = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&stderr_log_path)
+                .await
+            {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox = %sandbox_name,
+                        path = %stderr_log_path.display(),
+                        error = %e,
+                        "spawn_sandbox: failed to open msb stderr log; live stderr only"
+                    );
+                    None
+                }
+            };
+            let mut reader = stderr;
+            let mut host_stderr = tokio::io::stderr();
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = &buf[..n];
+                        let _ = host_stderr.write_all(chunk).await;
+                        let _ = host_stderr.flush().await;
+                        if let Some(f) = file.as_mut() {
+                            let _ = f.write_all(chunk).await;
+                            let _ = f.flush().await;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Some(mut f) = file {
+                let _ = f.shutdown().await;
+            }
+            tracing::debug!(
+                sandbox = %sandbox_name,
+                "spawn_sandbox: msb stderr stream ended"
+            );
+        });
+    }
 
     // Read the startup JSON from stdout.
     let stdout = child.stdout.take().ok_or_else(|| {
@@ -209,7 +270,13 @@ pub async fn spawn_sandbox(
         "spawn_sandbox: startup JSON received"
     );
 
-    let handle = ProcessHandle::new(startup.pid, config.name.clone(), child, file_mounts_staging);
+    let handle = ProcessHandle::new(
+        startup.pid,
+        config.name.clone(),
+        child,
+        file_mounts_staging,
+        Some(log_dir.clone()),
+    );
 
     Ok((handle, agent_sock_path))
 }

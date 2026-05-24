@@ -3,7 +3,7 @@
 //! [`ProcessHandle`] holds the PID of the sandbox process and provides
 //! methods for lifecycle management (signals, wait).
 
-use std::process::ExitStatus;
+use std::{path::PathBuf, process::ExitStatus};
 
 use nix::{
     sys::signal::{self, Signal},
@@ -35,6 +35,11 @@ pub struct ProcessHandle {
     /// Ephemeral staging directory for file mounts. Dropped when the
     /// process handle is dropped, which auto-removes all staged files.
     _file_mounts_staging: Option<TempDir>,
+
+    /// Sandbox `--log-dir`. Used by `wait()` to append a one-line
+    /// post-mortem record (`msb-exit.log`) so the exit status of the
+    /// VMM is recoverable after the agent-vm process is gone.
+    log_dir: Option<PathBuf>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -48,6 +53,7 @@ impl ProcessHandle {
         sandbox_name: String,
         child: Child,
         file_mounts_staging: Option<TempDir>,
+        log_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             pid,
@@ -55,6 +61,7 @@ impl ProcessHandle {
             child,
             detached: false,
             _file_mounts_staging: file_mounts_staging,
+            log_dir,
         }
     }
 
@@ -90,6 +97,45 @@ impl ProcessHandle {
         tracing::debug!(pid = self.pid, sandbox = %self.sandbox_name, "waiting for exit");
         let status = self.child.wait().await?;
         tracing::debug!(pid = self.pid, ?status, "process exited");
+        // Persist exit record so post-mortem can answer "did the VMM
+        // crash?" even after agent-vm itself is gone. Non-zero / signal
+        // exits also rate a `warn` trace so they appear under default
+        // `RUST_LOG=warn`.
+        let abnormal =
+            !status.success() || std::os::unix::process::ExitStatusExt::signal(&status).is_some();
+        if abnormal {
+            tracing::warn!(
+                pid = self.pid,
+                sandbox = %self.sandbox_name,
+                ?status,
+                "msb sandbox process exited abnormally"
+            );
+        }
+        if let Some(dir) = self.log_dir.as_deref() {
+            let path = dir.join("msb-exit.log");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let line = format!(
+                "{now}\tpid={}\tsandbox={}\tstatus={:?}\tabnormal={}\n",
+                self.pid, self.sandbox_name, status, abnormal
+            );
+            // Append so a series of crashes is visible at a glance —
+            // "5 boots in a row all SIGKILL'd at ~3h uptime" is much
+            // more useful than just the last boot's record. Best-
+            // effort: a write failure here just costs a hint.
+            use tokio::io::AsyncWriteExt as _;
+            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
+            {
+                let _ = f.write_all(line.as_bytes()).await;
+                let _ = f.flush().await;
+            }
+        }
         Ok(status)
     }
 
