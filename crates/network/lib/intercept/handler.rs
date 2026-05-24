@@ -227,16 +227,32 @@ impl Interceptor {
         // still gets to swap placeholders on streaming body bytes.
         self.state = State::Disabled;
 
-        // Empty hook stdout signals "passthrough": flush the prefix
-        // we held to upstream verbatim (re-using the existing
-        // ForwardBuffered code path) and let subsequent chunks
-        // continue. Non-empty stdout is the synthesized response
-        // (Intercept), same as before.
-        if response.is_empty() {
-            Ok(Verdict::ForwardBuffered(request))
+        // Three hook stdout shapes are recognised:
+        //
+        // - **Empty bytes**: passthrough verbatim. Flush the prefix
+        //   we held to upstream and let subsequent chunks continue.
+        // - **Starts with `HTTP/`**: synthesized response (Intercept).
+        //   The bytes are an HTTP/1.x response sent to the guest;
+        //   connection closes.
+        // - **Anything else**: passthrough with *modified bytes*.
+        //   The hook returned a rewritten request (typically: headers
+        //   altered, e.g. Authorization stripped). Forward THESE
+        //   bytes to upstream instead of the original prefix; let
+        //   subsequent chunks continue. The check is "starts with
+        //   `HTTP/`" because synthesized HTTP responses always begin
+        //   with the protocol version, while a modified request
+        //   always begins with the method (GET, POST, etc.). This
+        //   discrimination is unambiguous on the wire — a request
+        //   line never starts with `HTTP/` and a response line
+        //   always does.
+        let verdict = if response.is_empty() {
+            Verdict::ForwardBuffered(request)
+        } else if response.starts_with(b"HTTP/") {
+            Verdict::Intercept(response)
         } else {
-            Ok(Verdict::Intercept(response))
-        }
+            Verdict::ForwardBuffered(response)
+        };
+        Ok(verdict)
     }
 
     fn find_matching_rule(&self, method: &str, path: &str) -> Option<&InterceptRule> {
