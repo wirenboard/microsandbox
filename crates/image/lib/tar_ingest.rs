@@ -312,8 +312,22 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
                         tree.insert(&whiteout_path, node)?;
                     }
                     WhiteoutKind::None => {
-                        let mut buf = Vec::with_capacity(size as usize);
-                        entry.read_to_end(&mut buf).await.map_err(IngestError::Io)?;
+                        // Stream the entry through a small fixed-size buffer. A large
+                        // pre-allocated `Vec::with_capacity(size)` followed by
+                        // `read_to_end` interacts pathologically with async-compression +
+                        // flate2: flate2 zeroes the FULL output slice (= the Vec's spare
+                        // capacity) on every decompress call, giving O(N^2) memset cost
+                        // per file. See flate2::ffi::initialize_buffer.
+                        const CHUNK: usize = 64 * 1024;
+                        let mut chunk = vec![0u8; CHUNK];
+                        let mut buf: Vec<u8> = Vec::new();
+                        loop {
+                            let n = entry.read(&mut chunk).await.map_err(IngestError::Io)?;
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
 
                         // Spool large files to disk to bound memory usage.
                         let file_data = if buf.len() as u64 >= SPOOL_THRESHOLD
