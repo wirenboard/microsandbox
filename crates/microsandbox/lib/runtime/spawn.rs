@@ -167,14 +167,30 @@ pub async fn spawn_sandbox(
     })?;
     tracing::debug!(pid = _pid, sandbox = %config.name, "spawn_sandbox: process started");
 
-    // Tee msb's stderr → host stderr + <log_dir>/msb.stderr.log. The
-    // task ends when the child closes stderr (i.e. exits). Errors
-    // opening the file are logged but don't fail the spawn — we'd
-    // rather boot without disk-side capture than refuse to launch.
-    if let Some(stderr) = child.stderr.take() {
+    // Tee msb's stderr → on-disk log first, then host stderr.
+    //
+    // Critical ordering: disk write goes BEFORE the host-stderr
+    // write. If the parent's stderr is wedged (the very scenario the
+    // on-disk capture exists to survive — an attach loop stuck after
+    // a VM death), a host-stderr `write_all().await` parks
+    // indefinitely on the OS pipe / tty buffer. With the prior
+    // ordering, that park also stalled the file write and the read
+    // loop — child's 64 KiB stderr pipe filled, libkrun's synchronous
+    // write() in the VMM thread blocked, the VM froze. Disk-first
+    // means a wedged terminal can never starve the child pipe; the
+    // host-stderr write becomes best-effort and is given a short
+    // timeout so we don't deadlock on a terminal that never drains.
+    //
+    // Track the JoinHandle in ProcessHandle so wait() can drain the
+    // last chunk before returning (otherwise a libkrun SIGABRT
+    // backtrace's tail is lost when the runtime cancels the detached
+    // task on shutdown) and so a respawn-after-failure doesn't open
+    // msb.stderr.log with truncate(true) while the old task is still
+    // writing the prior boot's panic.
+    let stderr_tee = if let Some(stderr) = child.stderr.take() {
         let stderr_log_path = log_dir.join("msb.stderr.log");
         let sandbox_name = config.name.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
             let mut file = match tokio::fs::OpenOptions::new()
                 .create(true)
@@ -202,12 +218,24 @@ pub async fn spawn_sandbox(
                     Ok(0) => break,
                     Ok(n) => {
                         let chunk = &buf[..n];
-                        let _ = host_stderr.write_all(chunk).await;
-                        let _ = host_stderr.flush().await;
+                        // Disk first: guarantees the post-mortem
+                        // capture even if host stderr is wedged.
                         if let Some(f) = file.as_mut() {
                             let _ = f.write_all(chunk).await;
                             let _ = f.flush().await;
                         }
+                        // Host stderr is best-effort with a short
+                        // timeout. A wedged terminal must not stall
+                        // the read loop and thereby deadlock the
+                        // VMM (see comment above).
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            async {
+                                let _ = host_stderr.write_all(chunk).await;
+                                let _ = host_stderr.flush().await;
+                            },
+                        )
+                        .await;
                     }
                     Err(_) => break,
                 }
@@ -219,8 +247,10 @@ pub async fn spawn_sandbox(
                 sandbox = %sandbox_name,
                 "spawn_sandbox: msb stderr stream ended"
             );
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Read the startup JSON from stdout.
     let stdout = child.stdout.take().ok_or_else(|| {
@@ -238,10 +268,12 @@ pub async fn spawn_sandbox(
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
             terminate_startup_process(&mut child).await;
+            drain_stderr_tee(stderr_tee).await;
             return Err(err.into());
         }
         Err(_) => {
             terminate_startup_process(&mut child).await;
+            drain_stderr_tee(stderr_tee).await;
             return Err(crate::MicrosandboxError::Runtime(
                 "sandbox startup timeout: no JSON received within 30 seconds".into(),
             ));
@@ -252,6 +284,7 @@ pub async fn spawn_sandbox(
         Ok(info) => info,
         Err(_) => {
             let status = terminate_startup_process(&mut child).await;
+            drain_stderr_tee(stderr_tee).await;
             tracing::debug!(
                 raw_line = ?line,
                 exit_status = ?status,
@@ -276,9 +309,21 @@ pub async fn spawn_sandbox(
         child,
         file_mounts_staging,
         Some(log_dir.clone()),
+        stderr_tee,
     );
 
     Ok((handle, agent_sock_path))
+}
+
+/// Wait for the stderr-tee task to finish flushing the child's last
+/// bytes to disk. Used on error paths where the caller is about to
+/// return but we want the panic backtrace in `msb.stderr.log` to be
+/// complete before a subsequent retry truncates the file. Bounded
+/// timeout so a wedged tee task can never block a respawn.
+async fn drain_stderr_tee(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(h) = handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
