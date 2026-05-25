@@ -35,18 +35,33 @@ pub struct SecretsHandler {
     /// placeholder split across TCP writes still trips the violation check.
     /// Capped at `max_placeholder_len - 1` bytes.
     prev_tail: Vec<u8>,
-    /// Set to true once we've seen `\r\n\r\n` on this stream. Used by the
-    /// body-only fast path to safely distinguish "this chunk is body
-    /// continuation" from "this chunk is partial headers (no boundary yet)".
-    /// Without this, a chunk that happens to contain a placeholder in
-    /// partial headers would be returned verbatim, leaking the placeholder.
-    ///
-    /// Limitation: with HTTP/1.1 pipelining (multiple requests on one
-    /// connection) this flag stays true between requests, so the second
-    /// request's partial headers could be skipped. agent-vm clients
-    /// (Anthropic SDK, OpenAI SDK, gh, git) don't pipeline; for general
-    /// use, a Content-Length-aware reset would be needed.
+    /// Set to true once we've seen `\r\n\r\n` for the *current* request.
+    /// Distinguishes "this chunk is body continuation, skip violation
+    /// scan and substitution" from "this chunk is partial headers, still
+    /// in scope for both". Reset to false when the current request's
+    /// body completes (see `body_remaining`) so the next request on a
+    /// keep-alive connection starts fresh — without that reset, request
+    /// 2's pre-boundary chunks would silently skip the scan entirely
+    /// (security regression: a placeholder leaked in request 2's
+    /// `Authorization` header would pass through unchecked).
     headers_terminator_seen: bool,
+    /// Trailing bytes of the previous chunk's `data`, capped at 3 bytes
+    /// — used to detect the 4-byte `\r\n\r\n` boundary when TCP
+    /// segmentation cuts it across two chunks (e.g. chunk N ends with
+    /// `\r\n\r`, chunk N+1 starts with `\n`). Without this the boundary
+    /// is silently missed: `headers_terminator_seen` never flips, every
+    /// subsequent body chunk is scanned as headers, and a body byte
+    /// matching an ineligible placeholder drops the conn (false
+    /// positive ECONNRESET — the very class this scan was narrowed to
+    /// close). 3 bytes is exactly enough for a 4-byte boundary
+    /// straddling N/N+1 with no false negatives.
+    boundary_scratch: Vec<u8>,
+    /// Bytes of body remaining in the current request (Some), or unknown
+    /// framing (None — e.g. Transfer-Encoding: chunked, or
+    /// Content-Length absent). Decremented as body chunks arrive; when
+    /// it reaches 0 the per-request state is reset for the next request
+    /// on a keep-alive connection.
+    body_remaining: Option<u64>,
     /// SNI / destination host this handler was created for. Surfaced
     /// in the violation log so a "secret violation" line names which
     /// destination tripped — without it the warn is anonymous and
@@ -195,7 +210,68 @@ impl SecretsHandler {
             max_placeholder_len,
             prev_tail: Vec::new(),
             headers_terminator_seen: false,
+            boundary_scratch: Vec::new(),
+            body_remaining: None,
             sni: sni.to_string(),
+        }
+    }
+
+    /// Reset the per-request state so the next chunk is treated as the
+    /// start of a fresh request. Called when the current request's body
+    /// finishes (Content-Length bytes consumed). On a keep-alive
+    /// connection the next chunk is request 2's first bytes; without
+    /// this reset, `headers_terminator_seen` would stay true and the
+    /// violation scan would treat request 2's partial headers as
+    /// body-continuation, skipping the leak check entirely.
+    fn reset_request_state(&mut self) {
+        self.headers_terminator_seen = false;
+        self.body_remaining = None;
+        self.prev_tail.clear();
+        self.boundary_scratch.clear();
+    }
+
+    /// Find the `\r\n\r\n` boundary considering a possible cross-chunk
+    /// split. Searches in `boundary_scratch ++ data` so a boundary that
+    /// starts in the previous chunk's tail (e.g. `\r\n\r` + `\n…`) is
+    /// detected. Returns the offset in `data` immediately after the
+    /// final byte of the boundary — i.e. the start of the body in
+    /// `data`. Can be 0..=3 if the boundary spans the cut.
+    fn boundary_in(&self, data: &[u8]) -> Option<usize> {
+        let scratch_len = self.boundary_scratch.len();
+        if scratch_len == 0 {
+            return find_header_boundary(data);
+        }
+        // Stitch only the leading bytes of `data` we need to cover any
+        // straddling boundary (at most 3 bytes), to avoid allocating
+        // and scanning the whole chunk twice.
+        let take = (scratch_len + 4).min(scratch_len + data.len());
+        let stitched_len = scratch_len + data.len().min(take - scratch_len);
+        let mut stitched = Vec::with_capacity(stitched_len);
+        stitched.extend_from_slice(&self.boundary_scratch);
+        stitched.extend_from_slice(&data[..stitched_len - scratch_len]);
+        if let Some(pos) = find_header_boundary(&stitched) {
+            // pos is the offset of the byte after `\r\n\r\n` in stitched.
+            // Translate to data-local; saturating_sub handles the case
+            // where the boundary ended entirely within boundary_scratch
+            // (impossible — scratch is < 4 bytes — but defensive).
+            return Some(pos.saturating_sub(scratch_len));
+        }
+        // Boundary not in the straddle zone; fall back to a regular
+        // search in `data` so a fully-in-this-chunk boundary further in
+        // (past byte 4) is still found.
+        find_header_boundary(data)
+    }
+
+    /// Replace `boundary_scratch` with the trailing bytes of `data`
+    /// that could complete a 4-byte boundary on the next chunk. We
+    /// only need to keep the last 3 bytes (any more wouldn't help —
+    /// the boundary is 4 bytes).
+    fn update_boundary_scratch(&mut self, data: &[u8]) {
+        let keep = data.len().min(3);
+        self.boundary_scratch.clear();
+        if keep > 0 {
+            self.boundary_scratch
+                .extend_from_slice(&data[data.len() - keep..]);
         }
     }
 
@@ -210,60 +286,133 @@ impl SecretsHandler {
     /// Returns `None` if a violation is detected (placeholder going to a
     /// disallowed host) or `BlockAndTerminate` is triggered.
     pub fn substitute<'a>(&mut self, data: &'a [u8]) -> Option<Cow<'a, [u8]>> {
-        // Split raw bytes at the header boundary BEFORE converting to owned strings.
-        // This avoids position shifts from from_utf8_lossy replacement chars.
-        let boundary = find_header_boundary(data);
+        // Per-request state machine, ordered to honor two invariants
+        // that earlier revisions kept getting wrong:
+        //
+        //   (a) Body bytes are user-controlled content and MUST NOT
+        //       gate the violation scan or be UTF-8-round-tripped —
+        //       both produce ECONNRESET-style false positives in long
+        //       chat sessions that quote placeholder strings.
+        //   (b) But every CHUNK that's still in the header region of
+        //       SOME request (request 1 or request N≥2 on a keep-alive
+        //       connection) MUST be scanned for ineligible
+        //       placeholders, regardless of any optimization fast
+        //       path — otherwise a real leak via a Bearer header in
+        //       request 2's pre-boundary chunk passes through unchecked.
+        //
+        // The state machine: `headers_terminator_seen` tracks whether
+        // we're past the boundary of the CURRENT request. It's reset
+        // by `reset_request_state()` when `body_remaining` reaches 0
+        // (Content-Length-driven end-of-request). Cross-chunk boundary
+        // detection (`boundary_in`) catches `\r\n\r\n` even when TCP
+        // segmentation cuts it.
+        //
+        // Split raw bytes at the (cross-chunk-aware) header boundary
+        // BEFORE converting to owned strings — avoids position shifts
+        // from from_utf8_lossy replacement chars.
+        let boundary = self.boundary_in(data);
         let (header_bytes, body_bytes) = match boundary {
             Some(pos) => (&data[..pos], &data[pos..]),
             None => (data, &[] as &[u8]),
         };
-        // Header strings are always ASCII per HTTP spec; lossy conversion
-        // is a no-op for valid HTTP and a benign byte-replacement for
-        // junk we wouldn't have substituted into anyway.
-        let mut header_str = String::from_utf8_lossy(header_bytes).into_owned();
+        // Header strings are always ASCII per HTTP spec; lossy
+        // conversion is a no-op for valid HTTP and a benign
+        // byte-replacement for junk we wouldn't have substituted into
+        // anyway. Only allocate when there's actually a chance the
+        // headers carry a real boundary — body-continuation chunks
+        // pass an empty string to first_violation (line below) and
+        // never reach the header-substitution path.
+        let mut header_str = if boundary.is_some() || !self.headers_terminator_seen {
+            String::from_utf8_lossy(header_bytes).into_owned()
+        } else {
+            // Body continuation: no headers in this chunk. Avoid the
+            // lossy round-trip of body bytes, which would otherwise
+            // feed body content into basic_auth_decoded_contains via
+            // the stale prev_tail path (finding #7 in the post-fix
+            // review). Empty string is safe — first_violation only
+            // uses `headers` to look for `Authorization: Basic` lines,
+            // and an empty input has none.
+            String::new()
+        };
 
-        // Fast path: skip violation check when no ineligible secrets exist.
+        // STATE TRANSITION: flip `headers_terminator_seen` BEFORE any
+        // early-return so optimization paths can't elide the state
+        // update. This is the fix for findings #1 and #2 — the prior
+        // revision flipped after `eligible.is_empty()` and
+        // `!any_eligible_placeholder_present` returns, leaving the
+        // flag false on subsequent body chunks and re-running the body
+        // scan as if it were headers.
+        if boundary.is_some() {
+            self.headers_terminator_seen = true;
+            // Parse Content-Length from the now-complete headers so
+            // we know when this request ends and the next one starts
+            // (for keep-alive reset). Absent / Transfer-Encoding:
+            // chunked → leave body_remaining=None and accept that
+            // request 2's partial headers won't be re-scanned (chunked
+            // keep-alive request bodies don't carry credentials in
+            // agent-vm's client mix; documented limitation).
+            self.body_remaining = parse_request_body_length(&header_str);
+        }
+        // Account for body bytes in this chunk against the per-request
+        // counter. Either the whole post-boundary body slice (if
+        // boundary was found here) or the whole chunk (if we're past
+        // boundary). Reset when the body completes so the NEXT chunk
+        // on this connection is treated as request N+1's first bytes.
+        if let Some(remaining) = self.body_remaining.as_mut() {
+            let body_in_chunk = if boundary.is_some() {
+                body_bytes.len() as u64
+            } else if self.headers_terminator_seen {
+                data.len() as u64
+            } else {
+                0
+            };
+            *remaining = remaining.saturating_sub(body_in_chunk);
+        }
+        // Record `data`'s tail for the NEXT chunk's cross-chunk
+        // boundary search — must happen before any early return.
+        self.update_boundary_scratch(data);
+
+        // Violation scan: scope strictly to header bytes. Body bytes
+        // are user content and may legitimately contain literal
+        // `MSB_PLACEHOLDER_*` strings; blocking on those mid-upload
+        // surfaces as ECONNRESET. Pure body-continuation chunks pass
+        // an empty slice and the scan no-ops.
         if self.has_ineligible {
-            // Scan ONLY the header portion of this chunk. Body bytes are
-            // user content (chat prompts, code, quoted logs) and may
-            // legitimately contain literal `MSB_PLACEHOLDER_*` strings;
-            // blocking on those mid-upload surfaces to the guest as
-            // ECONNRESET and breaks long sessions. Body-continuation
-            // chunks (boundary already seen on this stream, none in this
-            // chunk) pass an empty slice and skip the scan entirely.
             let header_scan: &[u8] = if boundary.is_some() {
                 header_bytes
             } else if self.headers_terminator_seen {
                 &[]
             } else {
-                // No boundary yet on this stream — the whole chunk is
-                // still (potentially partial) headers.
+                // No boundary yet on this request — the whole chunk
+                // is still (potentially partial) headers.
                 data
             };
-            // Resolve the violation while only immutably borrowing self,
-            // then drop that borrow before any mutating call (update_tail).
             let violation = self
                 .first_violation(header_scan, &header_str)
                 .map(|(p, k)| (p.to_string(), k));
-            // Update the tail-sliding window with the same header
-            // scope. Once we've crossed into body, header_scan is
-            // empty so prev_tail naturally drains — body bytes never
-            // stitch into a future scan.
-            self.update_tail(header_scan);
+            // Update prev_tail with the SAME header scope, so a
+            // placeholder split across header chunks is still caught
+            // but body bytes never stitch into a future scan. The
+            // explicit clear on body transitions (when header_scan
+            // is empty) ensures prev_tail doesn't keep feeding stale
+            // header tail bytes into every subsequent body chunk.
+            if header_scan.is_empty() {
+                self.prev_tail.clear();
+            } else {
+                self.update_tail(header_scan);
+            }
             if let Some((placeholder, match_kind)) = violation {
                 // Capture which placeholder and via which encoding so
-                // the warn is actually useful — distinguishes "GH
-                // token leaking to Anthropic" from "OpenAI placeholder
-                // string quoted in the body". Truncate to a short
-                // prefix to avoid loud lines even though placeholders
-                // aren't themselves secret.
-                let placeholder_label = if placeholder.len() > 48 {
-                    format!("{}…(len {})", &placeholder[..48], placeholder.len())
-                } else {
-                    placeholder.clone()
-                };
+                // the warn is actually useful. Slice at a UTF-8 char
+                // boundary — `&placeholder[..48]` would panic if a
+                // user configures a non-ASCII placeholder whose 48th
+                // byte falls mid-codepoint.
+                let placeholder_label = truncate_at_char_boundary(&placeholder, 48);
                 match self.on_violation {
-                    ViolationAction::Block => return None,
+                    ViolationAction::Block => {
+                        self.maybe_reset_after_chunk();
+                        return None;
+                    }
                     ViolationAction::BlockAndLog => {
                         tracing::warn!(
                             sni = %self.sni,
@@ -271,6 +420,7 @@ impl SecretsHandler {
                             match_kind,
                             "secret violation: placeholder detected for disallowed host"
                         );
+                        self.maybe_reset_after_chunk();
                         return None;
                     }
                     ViolationAction::BlockAndTerminate => {
@@ -280,14 +430,22 @@ impl SecretsHandler {
                             match_kind,
                             "secret violation: placeholder detected for disallowed host — terminating"
                         );
+                        self.maybe_reset_after_chunk();
                         return None;
                     }
                 }
             }
+        } else {
+            // No ineligible secrets, so no scan to run — but we still
+            // need to maintain prev_tail / boundary_scratch and trigger
+            // the end-of-request reset so subsequent requests on the
+            // same conn behave correctly. The fast-path returns below
+            // call maybe_reset_after_chunk() for the same reason.
         }
 
         if self.eligible.is_empty() {
             // No substitution needed. Return borrowed slice (zero-copy).
+            self.maybe_reset_after_chunk();
             return Some(Cow::Borrowed(data));
         }
 
@@ -310,16 +468,9 @@ impl SecretsHandler {
                     && byte_contains(data, s.placeholder.as_bytes())
             });
             if !any_eligible_placeholder_present {
+                self.maybe_reset_after_chunk();
                 return Some(Cow::Borrowed(data));
             }
-        }
-
-        // Track that we've seen the header terminator on this stream.
-        // The body-only fast path below depends on this to distinguish
-        // "this chunk is body continuation" from "this chunk is partial
-        // headers, full request not yet received".
-        if boundary.is_some() {
-            self.headers_terminator_seen = true;
         }
 
         // Third fast path: this chunk is a pure body continuation. We
@@ -346,6 +497,7 @@ impl SecretsHandler {
             !(s.require_tls_identity && !self.tls_intercepted) && s.inject_body
         });
         if self.headers_terminator_seen && boundary.is_none() && !body_substitution_wanted {
+            self.maybe_reset_after_chunk();
             return Some(Cow::Borrowed(data));
         }
 
@@ -389,7 +541,19 @@ impl SecretsHandler {
             Some(b) => output.extend_from_slice(b.as_bytes()),
             None => output.extend_from_slice(body_bytes),
         }
+        self.maybe_reset_after_chunk();
         Some(Cow::Owned(output))
+    }
+
+    /// If the current request's body has been fully consumed (Content-
+    /// Length bytes accounted for in `body_remaining`), reset per-
+    /// request state so the next chunk is treated as request N+1's
+    /// first bytes. Called from every return path of `substitute` so
+    /// the reset is unconditional across optimization branches.
+    fn maybe_reset_after_chunk(&mut self) {
+        if matches!(self.body_remaining, Some(0)) {
+            self.reset_request_state();
+        }
     }
 
     /// Returns true if no secrets are configured.
@@ -625,6 +789,51 @@ fn find_header_boundary(data: &[u8]) -> Option<usize> {
 /// checks where allocating a String would defeat the purpose.
 fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Parse `Content-Length: N` from a complete HTTP/1.1 request-header
+/// block. Returns `Some(N)` only if the request can be reliably
+/// reset-on-completion: `Transfer-Encoding: chunked` (or any other
+/// Transfer-Encoding) gets `None` because the body-length is framed
+/// inline and parsing it would require tracking chunk-extension
+/// state across our 16 KiB read window. Returning `None` keeps
+/// `headers_terminator_seen` sticky for the remainder of the
+/// connection — a documented limitation; agent-vm's clients
+/// (Anthropic SDK, OpenAI SDK, gh, git) don't use chunked request
+/// bodies in practice.
+fn parse_request_body_length(headers: &str) -> Option<u64> {
+    let mut content_length: Option<u64> = None;
+    for line in headers.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            // ANY transfer-encoding (chunked, gzip, identity, …)
+            // means we can't trust Content-Length to delimit the
+            // body, per RFC 7230 §3.3.3.
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse::<u64>().ok();
+        }
+    }
+    content_length
+}
+
+/// Slice `s` at the last UTF-8 char boundary at or before byte
+/// `max_bytes`. Returns a sub-slice safe to use in format!/log
+/// macros without panicking when the configured placeholder happens
+/// to contain non-ASCII bytes straddling the truncation point.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…(len {})", &s[..cut], s.len())
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1028,6 +1237,139 @@ mod tests {
               {\"messages\":[{\"role\":\"user\",\"content\":\"OPENAI_KEY\"}]}";
         let out = handler.substitute(input).expect("body content is not a leak");
         assert!(out.windows(b"OPENAI_KEY".len()).any(|w| w == b"OPENAI_KEY"));
+    }
+
+    /// Regression for review finding #1: on a host with NO matching
+    /// secret (eligible.is_empty()), the prior implementation took an
+    /// early return at `if self.eligible.is_empty()` BEFORE flipping
+    /// `headers_terminator_seen`, so every subsequent body-only chunk
+    /// was scanned as if it were headers and a body byte matching an
+    /// ineligible placeholder dropped the conn. The fix hoists the
+    /// flip above all early returns.
+    #[test]
+    fn body_chunk_on_unrelated_host_passes_through_after_boundary() {
+        let config = make_config(vec![
+            make_secret("$ANTHROPIC", "real-a", "api.anthropic.com"),
+            make_secret("$OPENAI",    "real-o", "api.openai.com"),
+        ]);
+        // SNI = github.com → eligible.is_empty() for both secrets,
+        // but has_ineligible=true.
+        let mut h = SecretsHandler::new(&config, "github.com", true);
+        // Chunk 1: full HTTP request headers + tiny body, NO placeholder
+        // anywhere. Boundary present → headers_terminator_seen must flip.
+        let c1 = b"POST /api/foo HTTP/1.1\r\nHost: github.com\r\nContent-Length: 60\r\n\r\n{\"x\":\"y\"";
+        assert!(h.substitute(c1).is_some(), "chunk1 should pass");
+        // Chunk 2: continuation of body, contains an ineligible
+        // placeholder string. With the flip hoisted, this is a body
+        // chunk (header_scan = &[]) → no violation → pass.
+        let c2 = b",\"msg\":\"$OPENAI appears here\"}";
+        assert!(
+            h.substitute(c2).is_some(),
+            "chunk2 (body-only) must not block under header-only scope"
+        );
+    }
+
+    /// Regression for review finding #3: cross-chunk `\r\n\r\n`
+    /// boundary detection. Chunk 1 ends with `\r\n\r` (3 of 4 bytes),
+    /// chunk 2 starts with `\n…body…`. Before the fix
+    /// `find_header_boundary` was per-chunk and missed this; the
+    /// flip never fired and body bytes were scanned as headers.
+    #[test]
+    fn cross_chunk_boundary_split_is_detected() {
+        let config = make_config(vec![
+            make_secret("$ANTHROPIC", "real-a", "api.anthropic.com"),
+            make_secret("$OPENAI",    "real-o", "api.openai.com"),
+        ]);
+        let mut h = SecretsHandler::new(&config, "api.anthropic.com", true);
+        // Cut TCP at the most adversarial spot.
+        let c1 = b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer $ANTHROPIC\r\nContent-Length: 60\r\n\r";
+        let c2 = b"\n{\"msg\":\"$OPENAI in body\"}";
+        assert!(h.substitute(c1).is_some(), "chunk1 should pass");
+        assert!(
+            h.substitute(c2).is_some(),
+            "chunk2 must not block: boundary split across chunks should still be detected"
+        );
+    }
+
+    /// Regression for review finding #4 (security): on a keep-alive
+    /// connection, request 2's pre-boundary chunks MUST still be
+    /// scanned. Before the fix, `headers_terminator_seen` was sticky
+    /// from request 1 and request 2's partial-headers chunk got
+    /// `header_scan = &[]`, silently skipping the leak check.
+    #[test]
+    fn keepalive_request_2_partial_headers_are_still_scanned() {
+        let config = make_config(vec![
+            make_secret("$ANTHROPIC", "real-a", "api.anthropic.com"),
+            make_secret("$OPENAI",    "real-o", "api.openai.com"),
+        ]);
+        let mut h = SecretsHandler::new(&config, "api.anthropic.com", true);
+        // Request 1: complete, Content-Length: 0 → body completes
+        // immediately → reset_request_state() fires.
+        let r1 = b"POST / HTTP/1.1\r\nAuthorization: Bearer $ANTHROPIC\r\nContent-Length: 0\r\n\r\n";
+        assert!(h.substitute(r1).is_some(), "request 1 should pass");
+        // Request 2 chunk 1: PARTIAL headers carrying a leaking
+        // OPENAI placeholder in a non-Authorization header. The
+        // pre-fix sticky flag would skip the scan; with the reset,
+        // headers_terminator_seen is false and the chunk is scanned.
+        let r2_c1 = b"POST / HTTP/1.1\r\nX-Forward-Token: $OPENAI\r\n";
+        assert!(
+            h.substitute(r2_c1).is_none(),
+            "request 2 partial headers carrying $OPENAI to api.anthropic.com must be blocked"
+        );
+    }
+
+    /// Regression for review finding #2: a host WITH an eligible
+    /// secret, but configured with `basic_auth: false, headers: true`,
+    /// hit the `!any_basic_auth` early-return at line 313 when chunk 1
+    /// happened not to carry the eligible placeholder literal — the
+    /// flip was skipped and body chunks were rescanned as headers.
+    #[test]
+    fn body_chunk_passes_when_eligible_chunk1_lacks_placeholder() {
+        let mut anth = make_secret("$ANTHROPIC", "real-a", "api.anthropic.com");
+        anth.injection = SecretInjection {
+            headers: true,
+            basic_auth: false,
+            query_params: false,
+            body: false,
+        };
+        let openai = make_secret("$OPENAI", "real-o", "api.openai.com");
+        let mut h = SecretsHandler::new(&make_config(vec![anth, openai]), "api.anthropic.com", true);
+        // Chunk 1: headers + tiny body, no $ANTHROPIC literal (a
+        // GET-style probe before the authed POST).
+        let c1 = b"GET /health HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 32\r\n\r\n";
+        assert!(h.substitute(c1).is_some());
+        // Chunk 2: body containing $OPENAI literally → must NOT block.
+        let c2 = b"{\"msg\":\"$OPENAI in body content\"}";
+        assert!(
+            h.substitute(c2).is_some(),
+            "body chunk after eligible-placeholder-free chunk1 must not block"
+        );
+    }
+
+    /// Regression for review finding #7: a body chunk that happens to
+    /// contain `Authorization: Basic <b64-of-placeholder>` should NOT
+    /// be matched by `basic_auth_decoded_contains` once we're past
+    /// the boundary. The prior `update_tail(&[])` no-op left
+    /// prev_tail populated, and the wider header_str (lossy-decoded
+    /// body) flowed into the basic-auth decoder.
+    #[test]
+    fn body_chunk_with_authorization_basic_line_does_not_block() {
+        let config = make_config(vec![
+            make_secret("$ANTHROPIC", "real-a", "api.anthropic.com"),
+            make_secret("$OPENAI",    "real-o", "api.openai.com"),
+        ]);
+        let mut h = SecretsHandler::new(&config, "api.anthropic.com", true);
+        // Boundary in chunk 1; sets up prev_tail with header bytes.
+        let c1 = b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 80\r\n\r\n";
+        assert!(h.substitute(c1).is_some());
+        // Body containing an `Authorization: Basic` line whose
+        // base64 decodes to a string containing $OPENAI. (`JE9QRU5BSQ==`
+        // is base64 of `$OPENAI`.)
+        let c2 = b"prefix\r\nAuthorization: Basic JE9QRU5BSQ==\r\nsuffix that pads to length";
+        assert!(
+            h.substitute(c2).is_some(),
+            "body bytes shaped like an Authorization: Basic line must not feed the basic-auth decoder"
+        );
     }
 
     #[test]
