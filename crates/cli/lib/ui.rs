@@ -282,6 +282,13 @@ pub fn install_panic_hook() {
 /// to runtime.log directly. See [`install_panic_hook`].
 static SANDBOX_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// Publish the sandbox's `runtime.log` path so the panic hook can
+/// append the panic message directly to disk. Called from
+/// `sandbox_cmd::run` after `--log-dir` is parsed; the hook itself
+/// is installed earlier in `main` (before args are available), so
+/// this `OnceLock` is the channel between the two. Subsequent calls
+/// are silently ignored — first one wins, matching the OnceLock
+/// semantics.
 pub fn set_sandbox_log_path(path: std::path::PathBuf) {
     let _ = SANDBOX_LOG_PATH.set(path);
 }
