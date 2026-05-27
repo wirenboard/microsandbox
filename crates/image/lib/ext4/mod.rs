@@ -21,14 +21,16 @@ use format::{
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Default image size: 4 GiB.
-const DEFAULT_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Default image size: 16 GiB.
+const DEFAULT_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Default journal size in blocks (64 MiB at 4 KiB/block = 16384 blocks).
 const DEFAULT_JOURNAL_BLOCKS: u32 = 16384;
 
-/// Maximum number of block groups we format (keeps things simple).
-const MAX_GROUPS: u32 = 32;
+/// Maximum number of block groups we format. At the default 4 KiB block size
+/// and 32768 blocks/group (= 128 MiB/group), this caps the formatted FS at
+/// 128 × 128 MiB = 16 GiB.
+const MAX_GROUPS: u32 = 128;
 
 /// This minimal filesystem does not reserve space for online resize metadata.
 const RESERVED_GDT_BLOCKS: u32 = 0;
