@@ -168,18 +168,7 @@ async fn run(
             .chain(parse_listen_v6(&tcp6))
             .filter(|e| should_forward(*e))
             .collect();
-        // wanted: guest_port → was it loopback-only? (If the same
-        // port appears as both 127.0.0.1 and 0.0.0.0, the
-        // wildcard bind wins — no forwarder needed.)
-        let mut wanted: std::collections::BTreeMap<u16, bool> =
-            std::collections::BTreeMap::new();
-        for e in &listening {
-            let lb = needs_loopback_forwarder(*e);
-            wanted
-                .entry(e.port)
-                .and_modify(|prev| *prev = *prev && lb)
-                .or_insert(lb);
-        }
+        let wanted = collapse_listeners(&listening);
 
         // ADD: ports newly listening that we haven't mirrored yet.
         let new_ports: Vec<(u16, bool)> = wanted
@@ -474,4 +463,100 @@ async fn send_loopback_req<T: serde::Serialize>(
 
 fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
+}
+
+/// Collapse a set of LISTEN entries into a per-port map of "needs
+/// in-guest loopback forwarder?".
+///
+/// Rule: a port needs a forwarder only if every observed bind for
+/// that port is on loopback. The moment any wildcard bind appears
+/// on the same port, smoltcp's existing dial-to-VLAN-IP path
+/// already reaches that wildcard listener so the forwarder would
+/// be wasteful (and the agent app would receive duplicate
+/// connections through both paths).
+fn collapse_listeners(
+    listening: &std::collections::BTreeSet<ListenEntry>,
+) -> std::collections::BTreeMap<u16, bool> {
+    let mut out = std::collections::BTreeMap::new();
+    for e in listening {
+        let lb = needs_loopback_forwarder(*e);
+        out.entry(e.port)
+            .and_modify(|prev| *prev = *prev && lb)
+            .or_insert(lb);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn collapse_marks_loopback_only_ports_true() {
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8080,
+        });
+        let out = collapse_listeners(&s);
+        assert_eq!(out.get(&8080), Some(&true));
+    }
+
+    #[test]
+    fn collapse_marks_wildcard_only_ports_false() {
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 8080,
+        });
+        let out = collapse_listeners(&s);
+        assert_eq!(out.get(&8080), Some(&false));
+    }
+
+    #[test]
+    fn collapse_wildcard_wins_when_both_present() {
+        // Regression: an app that binds BOTH 127.0.0.1:80 (e.g. via
+        // a left-over `127.0.0.1:80` socket from an earlier client
+        // attempt) AND 0.0.0.0:80 (the real wildcard server)
+        // should NOT trigger an agentd forwarder — the wildcard
+        // bind is already smoltcp-reachable, and the forwarder
+        // would race for connections.
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 80,
+        });
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 80,
+        });
+        let out = collapse_listeners(&s);
+        assert_eq!(
+            out.get(&80),
+            Some(&false),
+            "wildcard must override loopback for the same port"
+        );
+    }
+
+    #[test]
+    fn collapse_independent_ports_keep_their_own_flag() {
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 7001,
+        });
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7002,
+        });
+        s.insert(ListenEntry {
+            addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port: 7003,
+        });
+        let out = collapse_listeners(&s);
+        assert_eq!(out.get(&7001), Some(&true));
+        assert_eq!(out.get(&7002), Some(&false));
+        assert_eq!(out.get(&7003), Some(&true));
+    }
 }
