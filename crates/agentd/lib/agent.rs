@@ -18,10 +18,14 @@ use microsandbox_protocol::exec::{
 };
 use microsandbox_protocol::fs::{FsData, FsRequest};
 use microsandbox_protocol::message::{Message, MessageType};
+use microsandbox_protocol::network::{
+    LoopbackForwardCancelReq, LoopbackForwardReq, LoopbackForwardResp,
+};
 
 use crate::config::AgentdConfig;
 use crate::error::{AgentdError, AgentdResult};
 use crate::fs::FsWriteSession;
+use crate::loopback::ForwarderRegistry;
 use crate::serial::AGENT_PORT_NAME;
 use crate::session::{ExecSession, SessionOutput};
 use crate::{clock, fs, heartbeat, serial};
@@ -83,6 +87,12 @@ pub async fn run(boot_time_ns: u64, init_time_ns: u64, config: &AgentdConfig) ->
     // Active filesystem write sessions.
     let mut write_sessions: HashMap<u32, FsWriteSession> = HashMap::new();
 
+    // Active loopback forwarders (eth0_ip:port → 127.0.0.1:port).
+    // Owned here so it lives for the agent loop's lifetime; cloned
+    // into handle_message so the handler can spawn/cancel without
+    // holding a long lock.
+    let forwarders = ForwarderRegistry::new();
+
     // Channel for session output events.
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<(u32, SessionOutput)>();
 
@@ -143,6 +153,7 @@ pub async fn run(boot_time_ns: u64, init_time_ns: u64, config: &AgentdConfig) ->
                                     &session_tx,
                                     &mut serial_out_buf,
                                     config,
+                                    &forwarders,
                                 ).await?;
                             }
 
@@ -218,6 +229,7 @@ async fn handle_message(
     session_tx: &mpsc::UnboundedSender<(u32, SessionOutput)>,
     out_buf: &mut Vec<u8>,
     config: &AgentdConfig,
+    forwarders: &ForwarderRegistry,
 ) -> AgentdResult<()> {
     match msg.t {
         MessageType::ExecRequest => {
@@ -350,6 +362,33 @@ async fn handle_message(
             }
         }
 
+        MessageType::LoopbackForward => {
+            let req: LoopbackForwardReq = match msg.payload() {
+                Ok(r) => r,
+                Err(e) => {
+                    write_loopback_resp(out_buf, msg.id, false, Some(format!("decode: {e}")))?;
+                    return Ok(());
+                }
+            };
+            let resp = match forwarders.spawn(req.bind_addr, req.port).await {
+                Ok(()) => LoopbackForwardResp { ok: true, error: None },
+                Err(e) => LoopbackForwardResp { ok: false, error: Some(e) },
+            };
+            write_loopback_resp(out_buf, msg.id, resp.ok, resp.error)?;
+        }
+
+        MessageType::LoopbackForwardCancel => {
+            let req: LoopbackForwardCancelReq = match msg.payload() {
+                Ok(r) => r,
+                Err(e) => {
+                    write_loopback_resp(out_buf, msg.id, false, Some(format!("decode: {e}")))?;
+                    return Ok(());
+                }
+            };
+            forwarders.cancel(req.port);
+            write_loopback_resp(out_buf, msg.id, true, None)?;
+        }
+
         MessageType::Shutdown => {
             // Graceful shutdown — signal all sessions, then ask the guest
             // kernel to power off so block-root filesystems can shut down
@@ -368,6 +407,24 @@ async fn handle_message(
         }
     }
 
+    Ok(())
+}
+
+/// Encode a [`LoopbackForwardResp`] frame onto `out_buf` for the
+/// given correlation id. Used by both the LoopbackForward and
+/// LoopbackForwardCancel arms — both reply with the same terminal
+/// payload shape.
+fn write_loopback_resp(
+    out_buf: &mut Vec<u8>,
+    id: u32,
+    ok: bool,
+    error: Option<String>,
+) -> AgentdResult<()> {
+    let payload = LoopbackForwardResp { ok, error };
+    let msg = Message::with_payload(MessageType::LoopbackForwardResp, id, &payload)
+        .map_err(|e| AgentdError::ExecSession(format!("encode loopback resp: {e}")))?;
+    codec::encode_to_buf(&msg, out_buf)
+        .map_err(|e| AgentdError::ExecSession(format!("encode loopback resp frame: {e}")))?;
     Ok(())
 }
 

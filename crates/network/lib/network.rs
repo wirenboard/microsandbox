@@ -254,6 +254,19 @@ impl SmoltcpNetwork {
         self.guest_mac
     }
 
+    /// Guest IPv4 address assigned to this sandbox, if any. Used by
+    /// the auto-publish loop to tell agentd what address to bind
+    /// its loopback forwarder on (so smoltcp's dial-to-VLAN-IP path
+    /// reaches that listener).
+    pub fn guest_ipv4(&self) -> Option<std::net::Ipv4Addr> {
+        self.guest_ipv4
+    }
+
+    /// Guest IPv6 address assigned to this sandbox, if any.
+    pub fn guest_ipv6(&self) -> Option<std::net::Ipv6Addr> {
+        self.guest_ipv6
+    }
+
     /// Generate `MSB_NET*` environment variables for the guest.
     ///
     /// The guest init (`agentd`) reads these to configure the network

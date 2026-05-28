@@ -241,6 +241,11 @@ pub(crate) struct AutoPublishHandles {
     pub(crate) port_handle:
         tokio::sync::mpsc::UnboundedSender<microsandbox_network::publisher::PortCommand>,
     pub(crate) cfg: microsandbox_network::config::AutoPublishConfig,
+    /// Guest's VLAN IPv4 address. Passed to agentd in
+    /// `LoopbackForwardReq` so it knows what address to bind the
+    /// in-guest forwarder on for `127.0.0.1`-only services.
+    /// `None` when the sandbox runs v6-only.
+    pub(crate) guest_ipv4: Option<std::net::Ipv4Addr>,
 }
 
 #[cfg(not(feature = "net"))]
@@ -541,6 +546,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             config.agent_sock_path.clone(),
             handles.cfg,
             handles.port_handle,
+            handles.guest_ipv4,
             adapter,
         );
     }
@@ -801,6 +807,7 @@ fn build_vm(
             auto_publish_handles = Some(AutoPublishHandles {
                 port_handle: network.port_handle(),
                 cfg: ap_cfg,
+                guest_ipv4: network.guest_ipv4(),
             });
         }
 

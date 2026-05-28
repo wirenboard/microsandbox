@@ -8,16 +8,16 @@
 //! the runtime crate in `runtime/lib/vm.rs`, because that's where
 //! the agent client lives.
 //!
-//! Filter policy: only **wildcard** (`0.0.0.0` / `[::]`) binds are
-//! auto-forwarded. Loopback-only guest binds (`127.0.0.1` /
-//! `[::1]`) are intentionally skipped because the smoltcp
-//! PortPublisher dials the guest's assigned VLAN address from
-//! inside the runtime, not the guest's loopback — a service that
-//! only listens on `127.0.0.1` from the guest's perspective
-//! refuses the connection. Reaching such services would need an
-//! in-guest socat/proxy, which agent-vm doesn't ship. (Lima can
-//! forward 127.0.0.1 because it uses SSH, which terminates on the
-//! guest's loopback; smoltcp has no such hop.)
+//! Filter policy: both **wildcard** (`0.0.0.0` / `[::]`) and
+//! **loopback** (`127.0.0.1` / `[::1]`) LISTEN binds are
+//! auto-forwarded. Loopback works because agentd lights up an
+//! in-guest forwarder (`eth0_ip:port → 127.0.0.1:port`) for each
+//! loopback bind we observe — the smoltcp PortPublisher's
+//! existing dial-to-guest-VLAN-IP path then lands on the agentd
+//! listener and gets bridged into loopback inside the guest. The
+//! runtime auto-publish loop in `runtime/lib/auto_publish.rs`
+//! sends `LoopbackForwardReq` for each detected loopback port
+//! before adding the host listener.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -58,13 +58,23 @@ pub fn parse_listen_v6(body: &str) -> BTreeSet<ListenEntry> {
     out
 }
 
-/// Subset of LISTEN entries that auto-publish should mirror. Only
-/// wildcard binds — see the module docs for why loopback binds are
-/// skipped.
+/// Subset of LISTEN entries that auto-publish should mirror.
+/// Wildcard *and* loopback both qualify — see the module-level
+/// docs for the agentd-side loopback forwarder that makes the
+/// loopback case work over smoltcp.
 pub fn should_forward(entry: ListenEntry) -> bool {
     match entry.addr {
-        IpAddr::V4(a) => a.is_unspecified(),
-        IpAddr::V6(a) => a.is_unspecified(),
+        IpAddr::V4(a) => a.is_unspecified() || a.is_loopback(),
+        IpAddr::V6(a) => a.is_unspecified() || a.is_loopback(),
+    }
+}
+
+/// True when this entry's address is a loopback bind that needs
+/// an in-guest agentd forwarder before smoltcp can reach it.
+pub fn needs_loopback_forwarder(entry: ListenEntry) -> bool {
+    match entry.addr {
+        IpAddr::V4(a) => a.is_loopback(),
+        IpAddr::V6(a) => a.is_loopback(),
     }
 }
 
@@ -179,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn should_forward_accepts_wildcard_only() {
+    fn should_forward_accepts_wildcard_and_loopback() {
         assert!(should_forward(ListenEntry {
             addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 80,
@@ -188,23 +198,36 @@ mod tests {
             addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             port: 80,
         }));
-    }
-
-    #[test]
-    fn should_forward_rejects_loopback_and_real_addresses() {
-        // Loopback: smoltcp publishes can't reach a guest-loopback-
-        // only service because the dial target is the guest's VLAN
-        // address, not 127.0.0.1 inside the guest.
-        assert!(!should_forward(ListenEntry {
+        assert!(should_forward(ListenEntry {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 80,
         }));
-        assert!(!should_forward(ListenEntry {
+        assert!(should_forward(ListenEntry {
             addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
             port: 80,
         }));
+    }
+
+    #[test]
+    fn should_forward_rejects_real_addresses() {
         assert!(!should_forward(ListenEntry {
             addr: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5)),
+            port: 80,
+        }));
+    }
+
+    #[test]
+    fn needs_loopback_forwarder_only_for_loopback() {
+        assert!(needs_loopback_forwarder(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 80,
+        }));
+        assert!(needs_loopback_forwarder(ListenEntry {
+            addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port: 80,
+        }));
+        assert!(!needs_loopback_forwarder(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 80,
         }));
     }

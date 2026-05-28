@@ -127,6 +127,24 @@ pub enum MessageType {
     /// correlation ID [`crate::network::PORT_EVENT_BROADCAST_ID`].
     /// Payload: [`crate::network::PortEvent`].
     PortEvent,
+
+    /// Host → agentd: request an in-guest loopback forwarder
+    /// (`bind_addr:port` → `127.0.0.1:port`). Payload:
+    /// [`crate::network::LoopbackForwardReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`] on the same
+    /// correlation ID.
+    LoopbackForward,
+
+    /// Host → agentd: cancel a forwarder previously installed via
+    /// [`Self::LoopbackForward`]. Payload:
+    /// [`crate::network::LoopbackForwardCancelReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`].
+    LoopbackForwardCancel,
+
+    /// agentd → host: ack for a LoopbackForward /
+    /// LoopbackForwardCancel. Terminal. Payload:
+    /// [`crate::network::LoopbackForwardResp`].
+    LoopbackForwardResp,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -174,8 +192,14 @@ impl MessageType {
     /// Computes the frame flags byte for this message type.
     pub fn flags(&self) -> u8 {
         match self {
-            Self::ExecExited | Self::ExecFailed | Self::FsResponse => FLAG_TERMINAL,
-            Self::ExecRequest | Self::FsRequest => FLAG_SESSION_START,
+            Self::ExecExited
+            | Self::ExecFailed
+            | Self::FsResponse
+            | Self::LoopbackForwardResp => FLAG_TERMINAL,
+            Self::ExecRequest
+            | Self::FsRequest
+            | Self::LoopbackForward
+            | Self::LoopbackForwardCancel => FLAG_SESSION_START,
             Self::Shutdown => FLAG_SHUTDOWN,
             _ => 0,
         }
@@ -200,6 +224,9 @@ impl MessageType {
             Self::FsResponse => "core.fs.response",
             Self::FsData => "core.fs.data",
             Self::PortEvent => "host.port.event",
+            Self::LoopbackForward => "guest.loopback.forward",
+            Self::LoopbackForwardCancel => "guest.loopback.forward.cancel",
+            Self::LoopbackForwardResp => "guest.loopback.forward.resp",
         }
     }
 
@@ -222,6 +249,9 @@ impl MessageType {
             "core.fs.response" => Some(Self::FsResponse),
             "core.fs.data" => Some(Self::FsData),
             "host.port.event" => Some(Self::PortEvent),
+            "guest.loopback.forward" => Some(Self::LoopbackForward),
+            "guest.loopback.forward.cancel" => Some(Self::LoopbackForwardCancel),
+            "guest.loopback.forward.resp" => Some(Self::LoopbackForwardResp),
             _ => None,
         }
     }
