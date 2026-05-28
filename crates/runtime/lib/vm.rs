@@ -226,6 +226,26 @@ type NetworkMetricsHandle = microsandbox_network::network::MetricsHandle;
 #[cfg(not(feature = "net"))]
 type NetworkMetricsHandle = ();
 
+/// Bundle of handles needed to spawn the auto-publish task after the
+/// relay is ready: the port-command sender (drives `PortPublisher`
+/// add/remove) and the auto-publish config (poll interval, host bind).
+/// Captured during `build_vm` so the caller can wire them up once
+/// the agent socket exists.
+///
+/// Defined unconditionally as a unit-like type when the `net`
+/// feature is off so it can sit in `build_vm`'s return tuple
+/// without per-field `cfg`-on-tuple-field tricks (which the
+/// language doesn't allow).
+#[cfg(feature = "net")]
+pub(crate) struct AutoPublishHandles {
+    pub(crate) port_handle:
+        tokio::sync::mpsc::UnboundedSender<microsandbox_network::publisher::PortCommand>,
+    pub(crate) cfg: microsandbox_network::config::AutoPublishConfig,
+}
+
+#[cfg(not(feature = "net"))]
+pub(crate) struct AutoPublishHandles;
+
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
@@ -356,7 +376,12 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_reason_for_observer = Arc::clone(&exit_reason);
     let exit_sock_path = config.agent_sock_path.clone();
     let exit_log_writer = exec_log_writer.clone();
-    let (vm, _network_termination_handle, network_metrics_handle) = match build_vm(
+    let (
+        vm,
+        _network_termination_handle,
+        network_metrics_handle,
+        auto_publish_handles,
+    ) = match build_vm(
         &config,
         console_backend,
         move |exit_code: i32| {
@@ -460,6 +485,13 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let (_relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::watch::channel(false);
     let (relay_drain_tx, mut relay_drain_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+    // Grab the broadcast handle off the relay BEFORE it gets moved
+    // into the wait_ready/run task — `broadcast_handle()` keeps an
+    // Arc to the clients map, so the handle stays valid for the
+    // relay's whole lifetime.
+    #[cfg(feature = "net")]
+    let relay_broadcast = relay.broadcast_handle();
+
     // Relay: spawn a blocking task for wait_ready, then run the accept loop.
     // wait_ready() must run AFTER enter() starts the VM (agentd sends core.ready),
     // so it runs on a background thread, not blocking the main thread.
@@ -477,6 +509,41 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             Err(e) => tracing::error!("agent relay wait_ready task panicked: {e}"),
         }
     });
+
+    // Auto-publish: spawn the poll loop now that the relay is
+    // running. The loop opens a loopback UDS to agent.sock, so it's
+    // safe to spawn even before wait_ready completes — the loop's
+    // initial `connect_with_retry` handles the brief race.
+    #[cfg(feature = "net")]
+    if let Some(handles) = auto_publish_handles {
+        struct RelayBroadcastAdapter(crate::relay::RelayBroadcast);
+        impl crate::auto_publish::EventBroadcast for RelayBroadcastAdapter {
+            fn broadcast_port_event(
+                &self,
+                event: microsandbox_protocol::network::PortEvent,
+            ) {
+                let id = microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID;
+                let msg = match microsandbox_protocol::message::Message::with_payload(
+                    microsandbox_protocol::message::MessageType::PortEvent,
+                    id,
+                    &event,
+                ) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+                self.0.broadcast(&msg);
+            }
+        }
+        let adapter: std::sync::Arc<dyn crate::auto_publish::EventBroadcast> =
+            std::sync::Arc::new(RelayBroadcastAdapter(relay_broadcast.clone()));
+        crate::auto_publish::spawn(
+            tokio_rt.handle(),
+            config.agent_sock_path.clone(),
+            handles.cfg,
+            handles.port_handle,
+            adapter,
+        );
+    }
 
     // Shutdown listener: when the relay receives core.shutdown from an SDK
     // client (e.g. sandbox.stop()), trigger VM exit.
@@ -550,6 +617,7 @@ fn build_vm(
     msb_krun::Vm,
     Option<NetworkTerminationHandle>,
     Option<NetworkMetricsHandle>,
+    Option<AutoPublishHandles>,
 )> {
     let mut exec_env = config.vm.env.clone();
     let vm = &config.vm;
@@ -711,6 +779,8 @@ fn build_vm(
 
     let mut network_termination_handle = None;
     let mut network_metrics_handle = None;
+    #[cfg(feature = "net")]
+    let mut auto_publish_handles: Option<AutoPublishHandles> = None;
 
     // Network.
     #[cfg(feature = "net")]
@@ -721,6 +791,18 @@ fn build_vm(
             microsandbox_network::network::SmoltcpNetwork::new(vm.network.clone(), vm.sandbox_slot);
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());
+
+        // Capture handles for auto-publish before `network` is moved
+        // into the rest of the builder steps. The port_handle is
+        // cloneable but the underlying sender lives until *some*
+        // clone exists, so as long as we hold one the channel into
+        // the smoltcp poll thread stays open.
+        if let Some(ap_cfg) = vm.network.auto_publish.clone() {
+            auto_publish_handles = Some(AutoPublishHandles {
+                port_handle: network.port_handle(),
+                cfg: ap_cfg,
+            });
+        }
 
         network.start(tokio_handle.clone());
 
@@ -784,7 +866,14 @@ fn build_vm(
         .build()
         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
 
-    Ok((vm, network_termination_handle, network_metrics_handle))
+    #[cfg(not(feature = "net"))]
+    let auto_publish_handles: Option<AutoPublishHandles> = None;
+    Ok((
+        vm,
+        network_termination_handle,
+        network_metrics_handle,
+        auto_publish_handles,
+    ))
 }
 
 //--------------------------------------------------------------------------------------------------

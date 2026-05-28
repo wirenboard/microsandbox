@@ -30,7 +30,7 @@ use crate::dns::{
 use crate::icmp_relay::IcmpRelay;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy;
-use crate::publisher::PortPublisher;
+use crate::publisher::{PortCommand, PortPublisher};
 use crate::shared::SharedState;
 use crate::tls::{proxy as tls_proxy, state::TlsState};
 use crate::udp_relay::UdpRelay;
@@ -197,6 +197,7 @@ pub fn smoltcp_poll_loop(
     dns_config: DnsConfig,
     tls_state: Option<Arc<TlsState>>,
     published_ports: Vec<PublishedPort>,
+    port_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PortCommand>,
     max_connections: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
 ) {
@@ -240,6 +241,7 @@ pub fn smoltcp_poll_loop(
         network_policy.clone(),
         shared.clone(),
         &tokio_handle,
+        port_cmd_rx,
     );
     let mut udp_relay = UdpRelay::new(
         shared.clone(),

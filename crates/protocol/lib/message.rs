@@ -121,6 +121,12 @@ pub enum MessageType {
 
     /// Streaming file data chunk (bidirectional).
     FsData,
+
+    /// Host-side broadcast: a published-port mapping was added or
+    /// removed. Emitted by the runtime relay on the reserved
+    /// correlation ID [`crate::network::PORT_EVENT_BROADCAST_ID`].
+    /// Payload: [`crate::network::PortEvent`].
+    PortEvent,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -193,6 +199,7 @@ impl MessageType {
             Self::FsRequest => "core.fs.request",
             Self::FsResponse => "core.fs.response",
             Self::FsData => "core.fs.data",
+            Self::PortEvent => "host.port.event",
         }
     }
 
@@ -214,6 +221,7 @@ impl MessageType {
             "core.fs.request" => Some(Self::FsRequest),
             "core.fs.response" => Some(Self::FsResponse),
             "core.fs.data" => Some(Self::FsData),
+            "host.port.event" => Some(Self::PortEvent),
             _ => None,
         }
     }

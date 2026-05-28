@@ -15,6 +15,7 @@ use msb_krun::backends::net::NetBackend;
 
 use crate::backend::SmoltcpBackend;
 use crate::config::NetworkConfig;
+use crate::publisher::PortCommand;
 use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
 use crate::stack::{self, GatewayIps, PollLoopConfig};
 use crate::tls::state::TlsState;
@@ -44,6 +45,14 @@ pub struct SmoltcpNetwork {
     shared: Arc<SharedState>,
     backend: Option<SmoltcpBackend>,
     poll_handle: Option<JoinHandle<()>>,
+
+    /// Sender for runtime [`PortCommand`]s. Created up front (before
+    /// the poll thread spawns) so the matching receiver can be moved
+    /// in below and clones of this sender can be handed out to any
+    /// task that wants to add/remove published ports at runtime
+    /// (e.g. the auto-publish poll loop). Taken once by `start()`.
+    port_cmd_tx: tokio::sync::mpsc::UnboundedSender<PortCommand>,
+    port_cmd_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PortCommand>>,
 
     // Resolved from config + slot.
     guest_mac: [u8; 6],
@@ -153,11 +162,15 @@ impl SmoltcpNetwork {
             None
         };
 
+        let (port_cmd_tx, port_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
         Self {
             config,
             shared,
             backend: Some(backend),
             poll_handle: None,
+            port_cmd_tx,
+            port_cmd_rx: Some(port_cmd_rx),
             guest_mac,
             gateway_mac,
             mtu,
@@ -196,6 +209,10 @@ impl SmoltcpNetwork {
         let tls_state = self.tls_state.clone();
         let published_ports = self.config.ports.clone();
         let max_connections = self.config.max_connections;
+        let port_cmd_rx = self
+            .port_cmd_rx
+            .take()
+            .expect("SmoltcpNetwork::start called twice");
 
         self.poll_handle = Some(
             std::thread::Builder::new()
@@ -208,12 +225,23 @@ impl SmoltcpNetwork {
                         dns_config,
                         tls_state,
                         published_ports,
+                        port_cmd_rx,
                         max_connections,
                         tokio_handle,
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),
         );
+    }
+
+    /// Cloneable sender for runtime [`PortCommand`]s. Stays valid
+    /// for the lifetime of the network: the matching receiver is
+    /// held by the poll loop, so commands sent after the poll loop
+    /// exits are silently dropped (the unbounded send still
+    /// succeeds locally — it's the poll-side `try_recv` that
+    /// disappears).
+    pub fn port_handle(&self) -> tokio::sync::mpsc::UnboundedSender<PortCommand> {
+        self.port_cmd_tx.clone()
     }
 
     /// Take the `NetBackend` for `VmBuilder::net()`. One-shot.

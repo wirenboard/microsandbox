@@ -315,5 +315,6 @@ pub mod exec;
 pub mod fs;
 pub mod heartbeat;
 pub mod message;
+pub mod network;
 
 pub use error::*;
