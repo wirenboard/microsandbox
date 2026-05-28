@@ -554,8 +554,49 @@ fn build_vm(
     let mut exec_env = config.vm.env.clone();
     let vm = &config.vm;
 
+    // Enable msb_krun's userspace split irqchip on x86_64. The default
+    // in-kernel IOAPIC is capped by KVM at 24 pins; the VMM only hands
+    // out IRQs 5..=15 from that range (arch::IRQ_MAX = 15), leaving
+    // room for ~11 virtio-mmio devices total. Between the OCI rootfs
+    // (one virtio-fs trampoline + two virtio-blk for VMDK lower + ext4
+    // upper, plus an extra virtio-blk per qcow2 backing entry), one
+    // virtio-fs per bind mount, virtio-net, virtio-vsock,
+    // virtio-console, and friends, that's saturated by an unsurprising
+    // config — adding an extra `--mount` then trips
+    // `RegisterNetDevice(IrqsExhausted)` at boot. The userspace IOAPIC
+    // raises the allocator cap to arch::IRQ_MAX_SPLIT = 223, at the
+    // cost of one extra worker thread (msb_krun spawns it
+    // automatically when `split_irqchip` is set). No effect on
+    // aarch64 / riscv64, where the GIC/AIA already supports >200 IRQs
+    // and `split_irqchip` is ignored.
+    //
+    // Requires msb_krun >= 0.1.13. 0.1.12's userspace IOAPIC had two
+    // observable problems with split_irqchip enabled:
+    //   - IRR was a `u32` (msb_krun_devices-0.1.12 legacy/ioapic.rs:98),
+    //     so any IRQ delivered on pin >= 32 was silently dropped via
+    //     `1 << i` wrapping. 0.1.13 widens IRR to `[u64; 4]`.
+    //   - Reads/writes of the redirection table used unchecked
+    //     `ioregsel - IOAPIC_REG_REDTBL_BASE` subtraction; the write
+    //     path had an early `return` guard but the read path returned
+    //     0 on every register the spec leaves unspecified. 0.1.13
+    //     replaces both with `checked_sub`.
+    // Empirically, 0.1.12 + split_irqchip + a couple of extra `--mount`
+    // entries exited cleanly within ~1.3s of `entering VM` with no
+    // visible panic — guest kernel almost certainly mis-read RTE state
+    // via the unchecked read path and gave up. 0.1.13 boots the same
+    // config to a working shell. The bumped cap was verified end-to-end
+    // with 8 user `--mount` entries: 19 virtio devices brought up on
+    // IO-APIC pins 5..23, well past the historic IRQ_MAX = 15 ceiling.
+    // (The userspace IOAPIC's pins 24..223 are exercised by the
+    // allocator but the in-guest IRQ traffic in that test all lands on
+    // pins <= 23; pin-24+ RTE handling is currently covered by upstream
+    // tests in msb_krun_devices, not this verification.)
     let mut builder = VmBuilder::new()
-        .machine(|m| m.vcpus(vm.vcpus).memory_mib(vm.memory_mib as usize))
+        .machine(|m| {
+            m.vcpus(vm.vcpus)
+                .memory_mib(vm.memory_mib as usize)
+                .split_irqchip(true)
+        })
         .kernel(|k| {
             let k = k.krunfw_path(&vm.libkrunfw_path);
             if let Some(ref init_path) = vm.init_path {

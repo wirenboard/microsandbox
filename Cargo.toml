@@ -51,6 +51,25 @@ lto = true
 strip = true
 panic = "abort"
 
+# wirenboard's libkrun fork of msb_krun_* 0.1.13 — see the outer
+# workspace Cargo.toml for the full rationale. Must mirror that file's
+# [patch.crates-io] block exactly (same rev, same crates) so the two
+# workspaces compile against identical msb_krun cohorts; mismatched
+# patches produce crate-identity errors across the agent-vm <->
+# microsandbox boundary.
+[patch.crates-io]
+msb_krun = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_arch = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_arch_gen = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_cpuid = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_devices = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_hvf = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_kernel = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_polly = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_smbios = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_utils = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+msb_krun_vmm = { git = "https://github.com/wirenboard/libkrun", rev = "38e46f2" }
+
 [workspace.dependencies]
 anyhow = "1.0"
 astral-tokio-tar = "0.6"
