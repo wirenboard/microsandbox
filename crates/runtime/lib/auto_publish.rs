@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use microsandbox_network::auto_publish::{
-    ListenEntry, needs_loopback_forwarder, parse_listen_v4, parse_listen_v6, should_forward,
+    ListenEntry, parse_listen_v4, parse_listen_v6, should_forward,
 };
 use microsandbox_network::config::AutoPublishConfig;
 use microsandbox_network::publisher::PortCommand;
@@ -29,8 +29,7 @@ use microsandbox_protocol::codec::{read_message, write_message};
 use microsandbox_protocol::fs::{FsData, FsOp, FsRequest, FsResponse};
 use microsandbox_protocol::message::{Message, MessageType};
 use microsandbox_protocol::network::{
-    LoopbackForwardCancelReq, LoopbackForwardReq, LoopbackForwardResp, PORT_EVENT_BROADCAST_ID,
-    PortEvent,
+    LoopbackForwardCancelReq, LoopbackForwardReq, LoopbackForwardResp, PortEvent,
 };
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -56,27 +55,42 @@ pub fn spawn(
     cfg: AutoPublishConfig,
     port_handle: UnboundedSender<PortCommand>,
     guest_ipv4: Option<std::net::Ipv4Addr>,
+    guest_ipv6: Option<std::net::Ipv6Addr>,
     event_broadcast: Arc<dyn EventBroadcast>,
 ) {
     runtime.spawn(async move {
         // Supervisor: re-establish the loopback UDS connection
         // after stream-level errors so a transient hiccup (broken
         // pipe, partial frame, malformed reply) doesn't silently
-        // disable auto-publish for the sandbox's lifetime. Each
-        // `run()` invocation creates a fresh UDS connection +
-        // handshake; on its own Err return we wait `restart_delay`
-        // and try again. `port_handle.send(...)` failing — the
-        // PortPublisher / smoltcp stack is gone — is the only
-        // sentinel for permanent shutdown; `run()` returns Ok in
-        // that case and we don't restart.
-        let restart_delay = Duration::from_millis(1000);
+        // disable auto-publish for the sandbox's lifetime.
+        //
+        // `active` is owned BY THE SUPERVISOR (not by run()) so
+        // mappings survive across reconnects. If the supervisor
+        // dropped its own `active`, the next run() would re-detect
+        // every still-LISTENing guest port as "new" and send
+        // PortCommand::Add — the matching host port is still owned
+        // by a listener registered in the previous run, so bind_host_for
+        // EADDRINUSEs and falls back to ephemeral. Result: each
+        // reconnect would leak one orphan listener per active port.
+        //
+        // `port_handle.send(...)` failing — the PortPublisher / smoltcp
+        // stack is gone — is the only sentinel for permanent shutdown;
+        // `run()` returns Ok in that case and we don't restart.
+        //
+        // Backoff: exponential with cap. Without this, a permanently
+        // unreachable agent.sock (relay shut down but supervisor not
+        // yet aborted) would spin at fixed 1s burning CPU.
+        let mut active: HashMap<u16, ActiveMapping> = HashMap::new();
+        let mut backoff = INITIAL_RESTART_BACKOFF;
         loop {
             match run(
                 &agent_sock_path,
                 &cfg,
                 &port_handle,
                 guest_ipv4,
+                guest_ipv6,
                 &*event_broadcast,
+                &mut active,
             )
             .await
             {
@@ -85,12 +99,41 @@ pub fn spawn(
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!(?e, "auto-publish: connection lost, reconnecting");
-                    tokio::time::sleep(restart_delay).await;
+                    tracing::warn!(
+                        ?e, ?backoff,
+                        "auto-publish: connection lost, reconnecting after backoff",
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_RESTART_BACKOFF);
                 }
             }
         }
     });
+}
+
+/// Initial supervisor restart delay. Short enough that a single
+/// dropped frame restarts within a poll cycle; long enough to
+/// avoid a hot loop when agent.sock is permanently gone.
+const INITIAL_RESTART_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Ceiling on the supervisor's exponential backoff between
+/// `run()` restarts.
+const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Distinguish stream-level errors (UDS dead — supervisor must
+/// reconnect) from app-level errors (agentd returned `ok=false`,
+/// CBOR decode failed, etc. — keep going on the existing stream).
+fn is_stream_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        BrokenPipe
+            | UnexpectedEof
+            | ConnectionReset
+            | ConnectionAborted
+            | NotConnected
+            | WriteZero
+    )
 }
 
 /// Abstraction so the runtime can plug its relay-side broadcast in
@@ -106,29 +149,68 @@ pub trait EventBroadcast: Send + Sync {
 
 /// Bookkeeping for one active mapping. Tracks the host side of
 /// the forward (so we can emit a precise `Removed` event later)
-/// plus whether agentd is running an in-guest loopback forwarder
-/// for this port — only true when the guest LISTEN was
-/// `127.0.0.1`-only.
+/// plus the `WantedFamily` the mapping was created for so the
+/// RECONCILE pass can detect bind-mode flips (and so a teardown
+/// knows whether to issue a LoopbackForwardCancel).
 struct ActiveMapping {
     host_bind: IpAddr,
     host_port: u16,
-    has_loopback_forwarder: bool,
+    /// The `WantedFamily` we wired up for. `WildcardAny` →
+    /// no agentd forwarder was spawned; the other variants both
+    /// imply a LoopbackForward was sent and must be cancelled on
+    /// teardown.
+    family: WantedFamily,
 }
+
+/// Reserved broadcast id (re-export of the protocol constant) that
+/// the IdCounter must never emit — a request id colliding with the
+/// PortEvent broadcast id would route the SDK's port_events
+/// subscriber the FsResponse/LoopbackForwardResp body, which it
+/// would then drop with `msg.t != PortEvent`.
+const RESERVED_BROADCAST_ID: u32 =
+    microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID;
 
 /// Monotonic id allocator clamped within the relay-assigned slot
 /// range. Without the clamp a raw `wrapping_add(1)` could carry us
 /// past `id_max` into a neighbouring slot's range, and the relay
 /// would route our FsResponse / LoopbackForwardResp to the wrong
-/// client. Mirrors the math in `AgentClient::next_id`.
+/// client. Mirrors the math in `AgentClient::next_id`, plus an
+/// extra guard against landing on
+/// [`microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID`] —
+/// for the highest relay slot, the raw slot range reaches
+/// `u32::MAX`, which includes that broadcast id.
+///
+/// Constructor `assert!`s (not `debug_assert!`) so a degenerate
+/// counter is loud in release. A single-id window would silently
+/// reuse the same correlation id for every request — the SDK
+/// reader_loop keys pending on id, so request N+1's reply tx
+/// overwrites request N's, and request N blocks forever.
 pub(crate) struct IdCounter {
     next: u32,
     min: u32,
+    /// Exclusive upper bound. Always strictly less than
+    /// `RESERVED_BROADCAST_ID + 1`, AND the constructor enforces
+    /// `min + 2 <= max` so the window has at least two distinct ids.
     max: u32,
 }
 
 impl IdCounter {
     pub(crate) fn new(min: u32, max: u32) -> Self {
-        debug_assert!(min < max);
+        // Clamp away from the broadcast id even if the caller passed
+        // a window that would include it. `RESERVED_BROADCAST_ID` is
+        // u32::MAX - 1, so `max = RESERVED_BROADCAST_ID` excludes it
+        // cleanly (the range is `[min, max)`).
+        let max = max.min(RESERVED_BROADCAST_ID);
+        // `assert!` not `debug_assert!` — a degenerate counter is a
+        // silent infinite-collision bug in release builds.
+        assert!(
+            min < max,
+            "IdCounter::new requires min ({min}) < max ({max}) after broadcast-id clamp"
+        );
+        assert!(
+            max - min >= 2,
+            "IdCounter::new requires a window of at least 2 ids; got [{min}, {max})"
+        );
         Self {
             next: min,
             min,
@@ -154,7 +236,9 @@ async fn run(
     cfg: &AutoPublishConfig,
     port_handle: &UnboundedSender<PortCommand>,
     guest_ipv4: Option<std::net::Ipv4Addr>,
+    guest_ipv6: Option<std::net::Ipv6Addr>,
     broadcast: &dyn EventBroadcast,
+    active: &mut HashMap<u16, ActiveMapping>,
 ) -> std::io::Result<()> {
     // Connect a loopback client to the relay. The handshake we
     // consume up front: 4 bytes of `id_offset`, then a Ready frame.
@@ -172,7 +256,7 @@ async fn run(
     let id_offset = u32::from_be_bytes(offset_buf);
     let mut read_half_tmp = BufReader::new(&mut stream);
     // Consume the Ready frame.
-    let ready = read_message(&mut read_half_tmp).await.map_err(io_err)?;
+    let ready = read_message(&mut read_half_tmp).await.map_err(protocol_err)?;
     debug_assert_eq!(ready.t, MessageType::Ready);
     drop(read_half_tmp);
 
@@ -182,21 +266,16 @@ async fn run(
     let host_bind: IpAddr = cfg.host_bind;
     let poll = Duration::from_millis(cfg.poll_interval_ms);
 
-    // Active mappings: guest_port → (host_bind, host_port,
-    // is_loopback). `is_loopback` records whether we asked agentd
-    // to spawn an in-guest forwarder for this port (so we can
-    // cancel it on teardown).
-    let mut active: HashMap<u16, ActiveMapping> = HashMap::new();
     // ID counter for our slot's range. Must stay within
     // `[id_offset + 1, id_offset + ID_RANGE_STEP)` — the relay
     // routes replies by `frame.id / ID_RANGE_STEP`, so a wrap
     // past our slot's upper bound would deliver responses to
     // somebody else's slot and we'd block forever on a reply
-    // that went to the wrong client (or worse, collide with
-    // `PORT_EVENT_BROADCAST_ID` and trip the SDK's PortEvent
-    // decoder). Mirrors `AgentClient::next_id`'s clamp logic.
+    // that went to the wrong client. IdCounter also clamps away
+    // from `PORT_EVENT_BROADCAST_ID` so a slot-15 client can't
+    // collide with the SDK's port_events subscriber.
     let id_range_step: u32 = u32::MAX / 16;
-    let id_min = id_offset + 1;
+    let id_min = id_offset.saturating_add(1);
     let id_max = id_offset.saturating_add(id_range_step);
     let mut next_req_id: IdCounter = IdCounter::new(id_min, id_max);
 
@@ -212,19 +291,31 @@ async fn run(
         .await
         {
             Ok(s) => s,
+            // Stream-level errors → bubble up to the supervisor so
+            // it reconnects. App-level errors (agentd refused the
+            // FsRequest, transient procfs glitch, CBOR decode bug)
+            // → log and try next poll on the same connection.
+            Err(e) if is_stream_error(&e) => return Err(e),
             Err(e) => {
-                tracing::debug!(?e, "auto-publish: read /proc/net/tcp failed");
+                tracing::debug!(?e, "auto-publish: read /proc/net/tcp failed (transient)");
                 continue;
             }
         };
-        let tcp6 = read_proc(
+        let tcp6 = match read_proc(
             "/proc/net/tcp6",
             &mut next_req_id,
             &mut write_half,
             &mut buf_read,
         )
         .await
-        .unwrap_or_default();
+        {
+            Ok(s) => s,
+            Err(e) if is_stream_error(&e) => return Err(e),
+            Err(e) => {
+                tracing::debug!(?e, "auto-publish: read /proc/net/tcp6 failed (transient)");
+                String::new()
+            }
+        };
 
         let listening: std::collections::BTreeSet<ListenEntry> = parse_listen_v4(&tcp4)
             .into_iter()
@@ -246,8 +337,8 @@ async fn run(
         let mutated: Vec<u16> = active
             .iter()
             .filter_map(|(port, mapping)| {
-                wanted.get(port).and_then(|wanted_lb| {
-                    (mapping.has_loopback_forwarder != *wanted_lb).then_some(*port)
+                wanted.get(port).and_then(|wf| {
+                    (mapping.family != *wf).then_some(*port)
                 })
             })
             .collect();
@@ -262,7 +353,7 @@ async fn run(
                     host_bind: mapping.host_bind,
                     host_port: mapping.host_port,
                 });
-                if mapping.has_loopback_forwarder {
+                if mapping.family.needs_loopback_forwarder() {
                     let _ = send_loopback_cancel(
                         guest_port,
                         &mut next_req_id,
@@ -281,22 +372,49 @@ async fn run(
 
         // ADD: ports newly listening that we haven't mirrored yet
         // (including ones torn down above by the RECONCILE pass).
-        let new_ports: Vec<(u16, bool)> = wanted
+        let new_ports: Vec<(u16, WantedFamily)> = wanted
             .iter()
             .filter(|(p, _)| !active.contains_key(p))
-            .map(|(p, lb)| (*p, *lb))
+            .map(|(p, wf)| (*p, *wf))
             .collect();
-        for (guest_port, is_loopback) in new_ports {
-            // For loopback-only guest LISTENs, ask agentd to bring
-            // up a forwarder on guest_ipv4:guest_port → 127.0.0.1:
-            // guest_port BEFORE the host listener gets wired up.
-            // Skipped silently when guest_ipv4 is None (v6-only
-            // sandbox) — loopback forwarding for those would need
-            // the IPv6 counterpart, not implemented yet.
-            let loopback_ok = if is_loopback {
-                match guest_ipv4 {
-                    Some(addr) => match send_loopback_forward(
-                        IpAddr::V4(addr),
+        for (guest_port, family) in new_ports {
+            // For loopback-only guest LISTENs we need agentd to
+            // bring up an in-guest forwarder. Two addresses matter:
+            //
+            //   bind_addr     — must match the family smoltcp dials
+            //                   (v4 if guest_ipv4 is set, else v6).
+            //                   Otherwise smoltcp's dial lands at no
+            //                   listener and clients ECONNREFUSE.
+            //
+            //   loopback_target — must match the LISTEN's family so
+            //                     the bridge actually reaches the
+            //                     guest service. A v6-only service
+            //                     at [::1]:port can't be dialed via
+            //                     127.0.0.1:port and vice versa.
+            //
+            // The two often coincide, but for a `[::1]` LISTEN on a
+            // dual-stack sandbox they differ: bind on guest_ipv4
+            // (where smoltcp goes) and dial [::1] (where the
+            // service is).
+            let smoltcp_dial_addr = guest_ipv4
+                .map(IpAddr::V4)
+                .or_else(|| guest_ipv6.map(IpAddr::V6));
+            let loopback_target: IpAddr = match family {
+                WantedFamily::LoopbackV4 => {
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                }
+                WantedFamily::LoopbackV6 => {
+                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                }
+                WantedFamily::WildcardAny => {
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                }
+            };
+            let loopback_ok = if family.needs_loopback_forwarder() {
+                match smoltcp_dial_addr {
+                    Some(bind_addr) => match send_loopback_forward(
+                        bind_addr,
+                        Some(loopback_target),
                         guest_port,
                         &mut next_req_id,
                         &mut write_half,
@@ -305,6 +423,7 @@ async fn run(
                     .await
                     {
                         Ok(()) => true,
+                        Err(e) if is_stream_error(&e) => return Err(e),
                         Err(e) => {
                             tracing::warn!(
                                 guest_port, ?e,
@@ -316,7 +435,8 @@ async fn run(
                     None => {
                         tracing::debug!(
                             guest_port,
-                            "auto-publish: skipping 127.0.0.1 LISTEN on v6-only sandbox",
+                            ?family,
+                            "auto-publish: skipping loopback LISTEN — sandbox has no guest IP",
                         );
                         false
                     }
@@ -347,7 +467,7 @@ async fn run(
                         ActiveMapping {
                             host_bind: addr.ip(),
                             host_port: addr.port(),
-                            has_loopback_forwarder: is_loopback,
+                            family,
                         },
                     );
                     broadcast.broadcast_port_event(PortEvent::Added {
@@ -358,7 +478,7 @@ async fn run(
                     tracing::info!(
                         guest_port,
                         host_port = addr.port(),
-                        loopback = is_loopback,
+                        ?family,
                         "auto-publish: mapping added",
                     );
                 }
@@ -367,7 +487,7 @@ async fn run(
                     // The loopback forwarder we asked agentd to
                     // spawn would now leak. Cancel it so we don't
                     // accumulate orphans across poll cycles.
-                    if is_loopback {
+                    if family.needs_loopback_forwarder() {
                         let _ = send_loopback_cancel(
                             guest_port,
                             &mut next_req_id,
@@ -392,7 +512,7 @@ async fn run(
                     host_bind: mapping.host_bind,
                     host_port: mapping.host_port,
                 });
-                if mapping.has_loopback_forwarder {
+                if mapping.family.needs_loopback_forwarder() {
                     if let Err(e) = send_loopback_cancel(
                         guest_port,
                         &mut next_req_id,
@@ -401,6 +521,9 @@ async fn run(
                     )
                     .await
                     {
+                        if is_stream_error(&e) {
+                            return Err(e);
+                        }
                         tracing::warn!(
                             guest_port, ?e,
                             "auto-publish: LoopbackForwardCancel failed (forwarder may leak)",
@@ -419,8 +542,6 @@ async fn run(
                 );
             }
         }
-
-        let _ = PORT_EVENT_BROADCAST_ID; // keep the import live; broadcast impl uses it.
     }
 }
 
@@ -472,11 +593,11 @@ async fn read_proc(
         },
     };
     let msg = Message::with_payload(MessageType::FsRequest, id, &req).map_err(io_err)?;
-    write_message(write_half, &msg).await.map_err(io_err)?;
+    write_message(write_half, &msg).await.map_err(protocol_err)?;
 
     let mut out = Vec::new();
     loop {
-        let msg = read_message(read_half).await.map_err(io_err)?;
+        let msg = read_message(read_half).await.map_err(protocol_err)?;
         if msg.id != id {
             // Not our reply (shouldn't happen on a private client,
             // but be defensive).
@@ -504,12 +625,17 @@ async fn read_proc(
 
 async fn send_loopback_forward(
     bind_addr: IpAddr,
+    loopback_target: Option<IpAddr>,
     port: u16,
     next_req_id: &mut IdCounter,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     read_half: &mut BufReader<&mut tokio::net::unix::OwnedReadHalf>,
 ) -> std::io::Result<()> {
-    let req = LoopbackForwardReq { bind_addr, port };
+    let req = LoopbackForwardReq {
+        bind_addr,
+        port,
+        loopback_target,
+    };
     send_loopback_req(
         MessageType::LoopbackForward,
         &req,
@@ -546,10 +672,10 @@ async fn send_loopback_req<T: serde::Serialize>(
 ) -> std::io::Result<()> {
     let id = next_req_id.next();
     let msg = Message::with_payload(msg_type, id, payload).map_err(io_err)?;
-    write_message(write_half, &msg).await.map_err(io_err)?;
+    write_message(write_half, &msg).await.map_err(protocol_err)?;
 
     loop {
-        let reply = read_message(read_half).await.map_err(io_err)?;
+        let reply = read_message(read_half).await.map_err(protocol_err)?;
         if reply.id != id {
             continue;
         }
@@ -573,26 +699,94 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// Collapse a set of LISTEN entries into a per-port map of "needs
-/// in-guest loopback forwarder?".
+/// Convert a [`microsandbox_protocol`] error into an `io::Error`
+/// while preserving the underlying `ErrorKind` when one exists.
+/// `io_err` flattens everything to `ErrorKind::Other`, which then
+/// hides stream-level errors from [`is_stream_error`] — the
+/// supervisor's reconnect path depends on us preserving
+/// `BrokenPipe` / `UnexpectedEof` / friends.
+fn protocol_err(e: microsandbox_protocol::ProtocolError) -> std::io::Error {
+    use microsandbox_protocol::ProtocolError;
+    match e {
+        ProtocolError::Io(io) => io,
+        ProtocolError::UnexpectedEof => std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
+/// Per-port summary the diff loop consumes: does this port need
+/// an in-guest forwarder (loopback-only) AND which IP family
+/// owns the LISTEN. The family matters for the loopback case: a
+/// `[::1]:port` LISTEN must trigger a v6 LoopbackForward (agentd
+/// binds the guest's v6 NIC address and dials `[::1]`), otherwise
+/// the bridge dials the wrong family and ECONNREFUSEs.
 ///
-/// Rule: a port needs a forwarder only if every observed bind for
-/// that port is on loopback. The moment any wildcard bind appears
-/// on the same port, smoltcp's existing dial-to-VLAN-IP path
-/// already reaches that wildcard listener so the forwarder would
-/// be wasteful (and the agent app would receive duplicate
-/// connections through both paths).
+/// For a wildcard bind (`0.0.0.0` or `[::]`) the smoltcp publisher
+/// reaches the guest service directly via the VLAN IP — family
+/// here is irrelevant; the runtime uses `WantedFamily::Any`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WantedFamily {
+    /// LISTEN bound on `127.0.0.1` only — need a v4 agentd
+    /// forwarder bound to `guest_ipv4:port → 127.0.0.1:port`.
+    LoopbackV4,
+    /// LISTEN bound on `[::1]` only — need a v6 agentd forwarder
+    /// bound to `[guest_ipv6]:port → [::1]:port`.
+    LoopbackV6,
+    /// Wildcard bind on either family — smoltcp dial works
+    /// without an agentd forwarder.
+    WildcardAny,
+}
+
+impl WantedFamily {
+    fn needs_loopback_forwarder(self) -> bool {
+        !matches!(self, WantedFamily::WildcardAny)
+    }
+}
+
+/// Collapse a set of LISTEN entries into a per-port [`WantedFamily`].
+///
+/// Rule: if ANY wildcard bind exists for the port, the port wants
+/// `WildcardAny` regardless of how many loopback binds also exist
+/// — smoltcp's dial-to-VLAN-IP path already reaches the wildcard
+/// listener, so spawning a forwarder would be wasteful and cause
+/// duplicate connections. Loopback-only ports become
+/// `LoopbackV4`/`LoopbackV6` based on the LISTEN's address family.
+/// A port with both v4 and v6 loopback binds (no wildcard) prefers
+/// v4 — agentd serves the v4 NIC bind via the v4 forwarder, and
+/// any client connecting via the host's v6 path still terminates
+/// at the v4 listener after smoltcp's family resolution.
 fn collapse_listeners(
     listening: &std::collections::BTreeSet<ListenEntry>,
-) -> std::collections::BTreeMap<u16, bool> {
+) -> std::collections::BTreeMap<u16, WantedFamily> {
     let mut out = std::collections::BTreeMap::new();
     for e in listening {
-        let lb = needs_loopback_forwarder(*e);
+        let this = match e.addr {
+            IpAddr::V4(a) if a.is_unspecified() => WantedFamily::WildcardAny,
+            IpAddr::V6(a) if a.is_unspecified() => WantedFamily::WildcardAny,
+            IpAddr::V4(a) if a.is_loopback() => WantedFamily::LoopbackV4,
+            IpAddr::V6(a) if a.is_loopback() => WantedFamily::LoopbackV6,
+            // Should not reach here because `should_forward` already
+            // filters to wildcard|loopback only — be defensive.
+            _ => continue,
+        };
         out.entry(e.port)
-            .and_modify(|prev| *prev = *prev && lb)
-            .or_insert(lb);
+            .and_modify(|prev| *prev = merge_wanted(*prev, this))
+            .or_insert(this);
     }
     out
+}
+
+fn merge_wanted(a: WantedFamily, b: WantedFamily) -> WantedFamily {
+    // Wildcard wins over loopback.
+    if matches!(a, WantedFamily::WildcardAny) || matches!(b, WantedFamily::WildcardAny) {
+        return WantedFamily::WildcardAny;
+    }
+    // Both loopback — prefer v4 if either is v4 (matches the doc
+    // comment above on collapse_listeners).
+    if matches!(a, WantedFamily::LoopbackV4) || matches!(b, WantedFamily::LoopbackV4) {
+        return WantedFamily::LoopbackV4;
+    }
+    WantedFamily::LoopbackV6
 }
 
 #[cfg(test)]
@@ -601,35 +795,48 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
-    fn collapse_marks_loopback_only_ports_true() {
+    fn collapse_marks_v4_loopback() {
         let mut s = std::collections::BTreeSet::new();
         s.insert(ListenEntry {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 8080,
         });
         let out = collapse_listeners(&s);
-        assert_eq!(out.get(&8080), Some(&true));
+        assert_eq!(out.get(&8080), Some(&WantedFamily::LoopbackV4));
     }
 
     #[test]
-    fn collapse_marks_wildcard_only_ports_false() {
+    fn collapse_marks_v6_loopback() {
+        // Regression: previously is_loopback was a single bool and
+        // the runtime always sent IpAddr::V4 to agentd, so a
+        // `[::1]:port` LISTEN got bridged to 127.0.0.1:port and
+        // ECONNREFUSED. With WantedFamily::LoopbackV6 the runtime
+        // picks the v6 NIC bind address.
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(ListenEntry {
+            addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port: 8080,
+        });
+        let out = collapse_listeners(&s);
+        assert_eq!(out.get(&8080), Some(&WantedFamily::LoopbackV6));
+    }
+
+    #[test]
+    fn collapse_marks_wildcard_only() {
         let mut s = std::collections::BTreeSet::new();
         s.insert(ListenEntry {
             addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 8080,
         });
         let out = collapse_listeners(&s);
-        assert_eq!(out.get(&8080), Some(&false));
+        assert_eq!(out.get(&8080), Some(&WantedFamily::WildcardAny));
     }
 
     #[test]
     fn collapse_wildcard_wins_when_both_present() {
-        // Regression: an app that binds BOTH 127.0.0.1:80 (e.g. via
-        // a left-over `127.0.0.1:80` socket from an earlier client
-        // attempt) AND 0.0.0.0:80 (the real wildcard server)
-        // should NOT trigger an agentd forwarder — the wildcard
-        // bind is already smoltcp-reachable, and the forwarder
-        // would race for connections.
+        // Regression: an app that binds BOTH 127.0.0.1:80 and
+        // 0.0.0.0:80 should NOT trigger an agentd forwarder — the
+        // wildcard bind is already smoltcp-reachable.
         let mut s = std::collections::BTreeSet::new();
         s.insert(ListenEntry {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -642,13 +849,46 @@ mod tests {
         let out = collapse_listeners(&s);
         assert_eq!(
             out.get(&80),
-            Some(&false),
+            Some(&WantedFamily::WildcardAny),
             "wildcard must override loopback for the same port"
         );
     }
 
     #[test]
-    fn collapse_independent_ports_keep_their_own_flag() {
+    fn collapse_v6_wildcard_wins_over_v4_loopback_on_same_port() {
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 80,
+        });
+        s.insert(ListenEntry {
+            addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            port: 80,
+        });
+        let out = collapse_listeners(&s);
+        assert_eq!(out.get(&80), Some(&WantedFamily::WildcardAny));
+    }
+
+    #[test]
+    fn collapse_both_loopback_families_prefer_v4() {
+        // Dual-stack loopback bind on a port — pick V4 so agentd
+        // installs a single forwarder on guest_ipv4:port and any
+        // client (v4 or v6 via smoltcp) terminates there.
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(ListenEntry {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 80,
+        });
+        s.insert(ListenEntry {
+            addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port: 80,
+        });
+        let out = collapse_listeners(&s);
+        assert_eq!(out.get(&80), Some(&WantedFamily::LoopbackV4));
+    }
+
+    #[test]
+    fn collapse_independent_ports_keep_their_own_family() {
         let mut s = std::collections::BTreeSet::new();
         s.insert(ListenEntry {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -663,9 +903,9 @@ mod tests {
             port: 7003,
         });
         let out = collapse_listeners(&s);
-        assert_eq!(out.get(&7001), Some(&true));
-        assert_eq!(out.get(&7002), Some(&false));
-        assert_eq!(out.get(&7003), Some(&true));
+        assert_eq!(out.get(&7001), Some(&WantedFamily::LoopbackV4));
+        assert_eq!(out.get(&7002), Some(&WantedFamily::WildcardAny));
+        assert_eq!(out.get(&7003), Some(&WantedFamily::LoopbackV6));
     }
 
     /// Regression for the wrap bug: a u32 counter that does
@@ -686,13 +926,46 @@ mod tests {
         assert_eq!(c.next(), 101);
     }
 
-    /// Edge: counter saturates at u32::MAX without panic.
+    /// Edge: counter near u32::MAX is clamped to skip the broadcast
+    /// id. Previously a slot-15 client (id_offset ≈ 0xF000_0000)
+    /// had id_max == u32::MAX, so next() could emit u32::MAX - 1 =
+    /// PORT_EVENT_BROADCAST_ID — that reply would be routed to the
+    /// SDK's port_events subscriber instead of back to us.
     #[test]
-    fn id_counter_handles_u32_max_window() {
-        let mut c = IdCounter::new(u32::MAX - 2, u32::MAX);
-        assert_eq!(c.next(), u32::MAX - 2);
-        // u32::MAX - 1 + 1 == u32::MAX == max → wrap
-        assert_eq!(c.next(), u32::MAX - 1);
-        assert_eq!(c.next(), u32::MAX - 2);
+    fn id_counter_excludes_port_event_broadcast_id() {
+        // Construct with a window whose nominal upper bound includes
+        // the broadcast id; the constructor must clamp it out.
+        let mut c = IdCounter::new(u32::MAX - 4, u32::MAX);
+        // Drive the counter through its full range. Expected ids are
+        // [MAX-4, MAX-3, MAX-2] — wrap before MAX-1 because the
+        // constructor clamps max to MAX-1 (== PORT_EVENT_BROADCAST_ID).
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            seen.insert(c.next());
+        }
+        assert!(
+            !seen.contains(&u32::MAX),
+            "must not emit u32::MAX (out of any client's slot)"
+        );
+        assert!(
+            !seen.contains(&u32::MAX.saturating_sub(1)),
+            "must not emit PORT_EVENT_BROADCAST_ID = u32::MAX - 1"
+        );
+    }
+
+    /// A degenerate single-id window must panic in release, not
+    /// silently return the same id forever. Old code used
+    /// `debug_assert!`, which optimised out in release builds and
+    /// produced an infinite correlation-id collision.
+    #[test]
+    #[should_panic(expected = "window of at least 2 ids")]
+    fn id_counter_rejects_single_id_window() {
+        let _ = IdCounter::new(100, 101);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires min")]
+    fn id_counter_rejects_inverted_window() {
+        let _ = IdCounter::new(200, 100);
     }
 }

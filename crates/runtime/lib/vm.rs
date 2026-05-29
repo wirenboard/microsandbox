@@ -246,6 +246,11 @@ pub(crate) struct AutoPublishHandles {
     /// in-guest forwarder on for `127.0.0.1`-only services.
     /// `None` when the sandbox runs v6-only.
     pub(crate) guest_ipv4: Option<std::net::Ipv4Addr>,
+    /// Guest's VLAN IPv6 address. Passed to agentd in
+    /// `LoopbackForwardReq` so it can bind on the v6 NIC address
+    /// for `[::1]`-only services. `None` when the sandbox runs
+    /// v4-only.
+    pub(crate) guest_ipv6: Option<std::net::Ipv6Addr>,
 }
 
 #[cfg(not(feature = "net"))]
@@ -547,6 +552,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             handles.cfg,
             handles.port_handle,
             handles.guest_ipv4,
+            handles.guest_ipv6,
             adapter,
         );
     }
@@ -808,6 +814,7 @@ fn build_vm(
                 port_handle: network.port_handle(),
                 cfg: ap_cfg,
                 guest_ipv4: network.guest_ipv4(),
+                guest_ipv6: network.guest_ipv6(),
             });
         }
 

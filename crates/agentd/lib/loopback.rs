@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::AbortHandle;
 
 /// Maximum backoff between failed accept() attempts.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
@@ -44,11 +43,18 @@ pub struct ForwarderRegistry {
     inner: Arc<Mutex<HashMap<u16, ForwarderHandle>>>,
 }
 
-/// One registry entry: the bound address and the abort handle of
-/// the spawned accept loop.
+/// One registry entry: the bound address, the loopback dial target,
+/// and the JoinHandle of the spawned accept loop. Stored so a
+/// later `spawn()` can decide between idempotent no-op (everything
+/// matches) and replace (any field differs). The full JoinHandle
+/// (not just AbortHandle) is kept so the replace path can await
+/// the prior task's exit — `abort()` is asynchronous, so the
+/// prior TcpListener may still be bound when we try to bind the
+/// new one and would otherwise EADDRINUSE on overlapping addresses.
 struct ForwarderHandle {
     bind_addr: IpAddr,
-    abort: AbortHandle,
+    loopback_target: IpAddr,
+    join: tokio::task::JoinHandle<()>,
 }
 
 impl ForwarderRegistry {
@@ -57,46 +63,77 @@ impl ForwarderRegistry {
         Self::default()
     }
 
-    /// Spawn a forwarder for `(bind_addr, port) → <bind_addr's
-    /// loopback family>:port` inside the guest.
+    /// Spawn a forwarder for `(bind_addr, port) → loopback_target:port`
+    /// inside the guest.
     ///
-    /// Family-aware: an IPv6 `bind_addr` makes the bridge dial
-    /// `[::1]:port`; an IPv4 bind_addr dials `127.0.0.1:port`.
-    /// Without this the runtime could ask agentd to forward a
-    /// `[::1]` LISTEN and every accepted connection would
-    /// ECONNREFUSE on the misfamily IPv4 dial.
+    /// `loopback_target` is the address the bridge dials per
+    /// accepted connection. When `None`, defaults to the same-family
+    /// loopback (`127.0.0.1` for v4 bind, `[::1]` for v6 bind). The
+    /// host runtime sets it explicitly when the LISTEN's family
+    /// differs from the smoltcp dial family — e.g. a `[::1]:port`
+    /// LISTEN with smoltcp dialing v4: bind on guest_v4 NIC so
+    /// smoltcp reaches the forwarder, but dial `[::1]` so the bridge
+    /// hits the actual service.
     ///
     /// If a forwarder is already registered for `port` with a
-    /// MATCHING bind_addr, this is a no-op (idempotent — covers
-    /// poll-cycle re-detection). If the registered bind_addr is
-    /// DIFFERENT (e.g. guest IP changed) the old forwarder is
-    /// cancelled and replaced — silently keeping the stale binding
-    /// would let smoltcp dial an address with no listener on it.
+    /// MATCHING (bind_addr, loopback_target) tuple, this is a no-op
+    /// (idempotent — covers poll-cycle re-detection). If EITHER
+    /// differs, the old forwarder is cancelled and replaced.
     ///
     /// Returns `Ok(())` on success; `Err` carries a stringified
     /// reason (today: bind failure).
-    pub async fn spawn(&self, bind_addr: IpAddr, port: u16) -> Result<(), String> {
-        {
-            let map = self.inner.lock().unwrap();
+    pub async fn spawn(
+        &self,
+        bind_addr: IpAddr,
+        port: u16,
+        loopback_target: Option<IpAddr>,
+    ) -> Result<(), String> {
+        let target = loopback_target.unwrap_or_else(|| loopback_for(bind_addr));
+
+        // Step 1: under the lock, decide between no-op and replace.
+        // For the replace case, REMOVE the prior entry so any
+        // concurrent spawn() observes "no entry" and races for the
+        // bind cleanly (one of them will EADDRINUSE, surfacing the
+        // race instead of silently leaking a stale entry).
+        let prior = {
+            let mut map = self.inner.lock().unwrap();
             if let Some(existing) = map.get(&port) {
-                if existing.bind_addr == bind_addr {
+                if existing.bind_addr == bind_addr && existing.loopback_target == target {
                     return Ok(());
                 }
-                // Fallthrough to replace.
+                map.remove(&port)
+            } else {
+                None
             }
+        };
+
+        // Step 2: await the prior task's exit BEFORE the new bind.
+        // abort() is asynchronous; if we bind eagerly, the prior
+        // TcpListener may still own the port and the new bind hits
+        // EADDRINUSE (especially likely when the bind_addrs overlap
+        // — e.g. 127.0.0.2 vs 0.0.0.0). Awaiting the JoinHandle
+        // also reaps the task so the runtime can release its slot.
+        if let Some(prev) = prior {
+            prev.join.abort();
+            let _ = prev.join.await;
         }
+
+        // Step 3: bind the new listener.
         let addr = SocketAddr::new(bind_addr, port);
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| format!("bind {addr}: {e}"))?;
-        let loopback_target = loopback_for(bind_addr);
-        let join = tokio::spawn(accept_loop(listener, loopback_target, port));
+        let join = tokio::spawn(accept_loop(listener, target, port));
         let new_handle = ForwarderHandle {
             bind_addr,
-            abort: join.abort_handle(),
+            loopback_target: target,
+            join,
         };
-        if let Some(prev) = self.inner.lock().unwrap().insert(port, new_handle) {
-            prev.abort.abort();
+        // Step 4: install. If another caller raced past Step 1 and
+        // already installed, we evict their handle — we already
+        // succeeded on the bind, so our listener is authoritative.
+        if let Some(loser) = self.inner.lock().unwrap().insert(port, new_handle) {
+            loser.join.abort();
         }
         Ok(())
     }
@@ -106,7 +143,7 @@ impl ForwarderRegistry {
     /// accept loop stops.
     pub fn cancel(&self, port: u16) {
         if let Some(h) = self.inner.lock().unwrap().remove(&port) {
-            h.abort.abort();
+            h.join.abort();
         }
     }
 }
@@ -217,10 +254,10 @@ mod tests {
         let bind = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
         let port = ephemeral_port(bind).await;
         let reg = ForwarderRegistry::new();
-        reg.spawn(bind, port).await.unwrap();
+        reg.spawn(bind, port, None).await.unwrap();
         // Second call with the same bind_addr should be a no-op —
         // a second bind() would EADDRINUSE.
-        reg.spawn(bind, port).await.unwrap();
+        reg.spawn(bind, port, None).await.unwrap();
         reg.cancel(port);
     }
 
@@ -255,7 +292,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let reg = ForwarderRegistry::new();
-        reg.spawn(bind, port).await.unwrap();
+        reg.spawn(bind, port, None).await.unwrap();
 
         // Connect to the forwarder's nic-alias address. The
         // forwarder should accept, dial 127.0.0.1:port, and echo
@@ -307,16 +344,41 @@ mod tests {
         // address.
         let port = ephemeral_port(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))).await;
         let reg = ForwarderRegistry::new();
-        reg.spawn(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), port)
+        reg.spawn(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), port, None)
             .await
             .unwrap();
         // Different bind_addr → must replace, not short-circuit.
         // 127.0.0.3 is also on lo. The new bind succeeds because
         // the old listener gets aborted; if the old listener
         // weren't released we'd EADDRINUSE here.
-        reg.spawn(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), port)
+        reg.spawn(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), port, None)
             .await
             .unwrap();
+        reg.cancel(port);
+    }
+
+    /// New: spawn with the same bind_addr but DIFFERENT
+    /// loopback_target must replace, not no-op. This is the
+    /// cross-family case (v6 LISTEN with v4 smoltcp dial): we
+    /// keep the v4 NIC bind but flip the bridge dial target
+    /// between calls.
+    #[tokio::test]
+    async fn spawn_replaces_when_loopback_target_changes() {
+        let bind = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let port = ephemeral_port(bind).await;
+        let reg = ForwarderRegistry::new();
+        // First spawn: default target = 127.0.0.1
+        reg.spawn(bind, port, None).await.unwrap();
+        // Second spawn: same bind_addr, EXPLICIT V6 target. Must
+        // replace the existing entry (different loopback_target)
+        // and NOT EADDRINUSE — the old listener must release.
+        reg.spawn(
+            bind,
+            port,
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        )
+        .await
+        .unwrap();
         reg.cancel(port);
     }
 

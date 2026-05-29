@@ -370,7 +370,10 @@ async fn handle_message(
                     return Ok(());
                 }
             };
-            let resp = match forwarders.spawn(req.bind_addr, req.port).await {
+            let resp = match forwarders
+                .spawn(req.bind_addr, req.port, req.loopback_target)
+                .await
+            {
                 Ok(()) => LoopbackForwardResp { ok: true, error: None },
                 Err(e) => LoopbackForwardResp { ok: false, error: Some(e) },
             };

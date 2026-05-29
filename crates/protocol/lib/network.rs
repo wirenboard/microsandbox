@@ -39,9 +39,11 @@ pub const PORT_EVENT_BROADCAST_ID: u32 = u32::MAX - 1;
 /// like Lima's guestagent does.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopbackForwardReq {
-    /// In-guest bind address for the forwarder's listener. Usually
-    /// the guest's eth0 IPv4 (or IPv6) so the smoltcp publisher's
-    /// existing dial-to-guest-VLAN-IP path lands here.
+    /// In-guest bind address for the forwarder's listener. MUST
+    /// match the family the smoltcp PortPublisher dials — today
+    /// that's `guest_ipv4` if present, else `guest_ipv6`. If the
+    /// bind family doesn't match smoltcp's dial choice, the smoltcp
+    /// connection lands at no listener and clients see ECONNREFUSED.
     pub bind_addr: IpAddr,
     /// Port to bind on the guest side AND the loopback port to
     /// re-dial. Both sides use the same number — the listener and
@@ -49,6 +51,19 @@ pub struct LoopbackForwardReq {
     /// a guest app bound to `127.0.0.1:port` and the forwarder
     /// bound to `eth0_ip:port` do not collide.
     pub port: u16,
+    /// Loopback address inside the guest that the forwarder dials
+    /// per accepted connection. When `None`, agentd defaults to
+    /// the loopback address in the same family as `bind_addr`
+    /// (e.g. `127.0.0.1` for an IPv4 bind). The host runtime must
+    /// set this explicitly when the LISTEN's family differs from
+    /// the smoltcp dial family — e.g. a `[::1]:port` LISTEN with a
+    /// v4-preferring smoltcp publisher: bind_addr=guest_ipv4 (so
+    /// smoltcp reaches the forwarder), loopback_target=`Some(::1)`
+    /// (so the bridge dials the actual service). Without this
+    /// override, a v4 bind would dial `127.0.0.1` and miss a
+    /// v6-only service.
+    #[serde(default)]
+    pub loopback_target: Option<IpAddr>,
 }
 
 /// Host → agentd: stop a previously-spawned forwarder.
