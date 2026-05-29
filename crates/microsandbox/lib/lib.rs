@@ -24,6 +24,8 @@ pub use error::*;
 pub use image::{Image, ImageConfigDetail, ImageDetail, ImageHandle, ImageLayerDetail};
 pub use microsandbox_image::RegistryAuth;
 pub use microsandbox_protocol as protocol;
+#[cfg(feature = "net")]
+pub use microsandbox_network;
 pub use microsandbox_runtime::logging::LogLevel;
 pub use microsandbox_utils::size;
 #[cfg(feature = "net")]

@@ -12,7 +12,9 @@ use crate::config::{
 };
 use crate::dns::Nameserver;
 use crate::intercept::config::{InterceptConfig, InterceptRule};
-use crate::policy::{BuildError, NetworkPolicy};
+use crate::policy::{
+    BuildError, Destination, DestinationGroup, NetworkPolicy, Rule,
+};
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretValue, ViolationAction,
 };
@@ -131,6 +133,40 @@ impl NetworkBuilder {
     /// Set the network policy.
     pub fn policy(mut self, policy: NetworkPolicy) -> Self {
         self.config.policy = policy;
+        self
+    }
+
+    /// Append an egress allow rule for an IP or CIDR — equivalent to
+    /// `policy.rules.push(Rule::allow_egress(Destination::Cidr(...)))`.
+    ///
+    /// The default policy (`NetworkPolicy::public_only`) denies every
+    /// destination group except `Public` + DNS. Hosts on RFC1918,
+    /// loopback, link-local, and the gateway address are rejected
+    /// with ECONNREFUSED at the smoltcp policy gate. This helper lets
+    /// the caller punch a hole through that default for one specific
+    /// IP/CIDR — typically a dev box on the same LAN as the host.
+    ///
+    /// Rule is appended (not prepended), so explicit deny rules added
+    /// earlier still win. To allow an entire `DestinationGroup` see
+    /// [`Self::allow_egress_group`].
+    pub fn allow_egress_cidr(mut self, cidr: ipnetwork::IpNetwork) -> Self {
+        self.config
+            .policy
+            .rules
+            .push(Rule::allow_egress(Destination::Cidr(cidr)));
+        self
+    }
+
+    /// Append an egress allow rule for an entire `DestinationGroup`
+    /// (Public / Private / Loopback / LinkLocal / Metadata / Host /
+    /// Multicast). The most common use is `Private` — equivalent to
+    /// switching from `NetworkPolicy::public_only` to
+    /// `NetworkPolicy::non_local` without replacing the whole policy.
+    pub fn allow_egress_group(mut self, group: DestinationGroup) -> Self {
+        self.config
+            .policy
+            .rules
+            .push(Rule::allow_egress(Destination::Group(group)));
         self
     }
 
@@ -651,5 +687,77 @@ mod tests {
         assert_eq!(cfg.ports[0].protocol, PortProtocol::Tcp);
         assert_eq!(cfg.ports[1].host_bind, bind);
         assert_eq!(cfg.ports[1].protocol, PortProtocol::Udp);
+    }
+
+    #[test]
+    fn allow_egress_cidr_appends_rule_that_overrides_public_only_deny() {
+        // Default policy denies Private (10.0.0.0/8). After calling
+        // allow_egress_cidr, evaluate_egress for an IP in the CIDR
+        // must return Allow.
+        use crate::policy::{Action, NetworkPolicy, Protocol};
+        use std::net::SocketAddr;
+        let shared = std::sync::Arc::new(crate::shared::SharedState::new(
+            crate::shared::DEFAULT_QUEUE_CAPACITY,
+        ));
+        let cfg = NetworkBuilder::new()
+            .allow_egress_cidr("10.100.1.0/24".parse().unwrap())
+            .build()
+            .unwrap();
+        // Sanity: default policy is public_only.
+        let default = NetworkPolicy::public_only();
+        let target: SocketAddr = "10.100.1.75:80".parse().unwrap();
+        assert!(
+            default
+                .evaluate_egress(target, Protocol::Tcp, &shared)
+                == Action::Deny,
+            "default public_only must DENY a Private IP"
+        );
+        assert!(
+            cfg.policy
+                .evaluate_egress(target, Protocol::Tcp, &shared)
+                == Action::Allow,
+            "allow_egress_cidr must override the default Deny for IPs in the CIDR"
+        );
+        // An IP outside the allowed CIDR still gets the default Deny.
+        let other: SocketAddr = "192.168.1.1:80".parse().unwrap();
+        assert!(
+            cfg.policy
+                .evaluate_egress(other, Protocol::Tcp, &shared)
+                == Action::Deny,
+            "allow_egress_cidr must NOT affect IPs outside the CIDR"
+        );
+    }
+
+    #[test]
+    fn allow_egress_group_private_opens_the_whole_lan() {
+        // Equivalent to switching from public_only to non_local
+        // without replacing the whole policy.
+        use crate::policy::{Action, Protocol};
+        use std::net::SocketAddr;
+        let shared = std::sync::Arc::new(crate::shared::SharedState::new(
+            crate::shared::DEFAULT_QUEUE_CAPACITY,
+        ));
+        let cfg = NetworkBuilder::new()
+            .allow_egress_group(DestinationGroup::Private)
+            .build()
+            .unwrap();
+        for ip_port in ["10.0.0.1:80", "172.16.5.5:443", "192.168.1.1:22"] {
+            let target: SocketAddr = ip_port.parse().unwrap();
+            assert_eq!(
+                cfg.policy
+                    .evaluate_egress(target, Protocol::Tcp, &shared),
+                Action::Allow,
+                "allow_egress_group(Private) must allow {ip_port}"
+            );
+        }
+        // Loopback / link-local / metadata still denied — Private
+        // group is disjoint from those.
+        let metadata: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        assert_eq!(
+            cfg.policy
+                .evaluate_egress(metadata, Protocol::Tcp, &shared),
+            Action::Deny,
+            "allow_egress_group(Private) must NOT open Metadata"
+        );
     }
 }
