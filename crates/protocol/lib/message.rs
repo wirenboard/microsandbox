@@ -121,6 +121,30 @@ pub enum MessageType {
 
     /// Streaming file data chunk (bidirectional).
     FsData,
+
+    /// Host-side broadcast: a published-port mapping was added or
+    /// removed. Emitted by the runtime relay on the reserved
+    /// correlation ID [`crate::network::PORT_EVENT_BROADCAST_ID`].
+    /// Payload: [`crate::network::PortEvent`].
+    PortEvent,
+
+    /// Host → agentd: request an in-guest loopback forwarder
+    /// (`bind_addr:port` → `127.0.0.1:port`). Payload:
+    /// [`crate::network::LoopbackForwardReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`] on the same
+    /// correlation ID.
+    LoopbackForward,
+
+    /// Host → agentd: cancel a forwarder previously installed via
+    /// [`Self::LoopbackForward`]. Payload:
+    /// [`crate::network::LoopbackForwardCancelReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`].
+    LoopbackForwardCancel,
+
+    /// agentd → host: ack for a LoopbackForward /
+    /// LoopbackForwardCancel. Terminal. Payload:
+    /// [`crate::network::LoopbackForwardResp`].
+    LoopbackForwardResp,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -166,9 +190,20 @@ impl Message {
 
 impl MessageType {
     /// Computes the frame flags byte for this message type.
+    ///
+    /// `LoopbackForward` and `LoopbackForwardCancel` are intentionally
+    /// NOT marked `FLAG_SESSION_START` — they're one-shot RPCs,
+    /// not streaming sessions, so the relay shouldn't register
+    /// their correlation IDs into `client.active_sessions`. The
+    /// matching `LoopbackForwardResp` still carries `FLAG_TERMINAL`
+    /// so the SDK client's pending-map subscription is removed
+    /// after the reply is delivered.
     pub fn flags(&self) -> u8 {
         match self {
-            Self::ExecExited | Self::ExecFailed | Self::FsResponse => FLAG_TERMINAL,
+            Self::ExecExited
+            | Self::ExecFailed
+            | Self::FsResponse
+            | Self::LoopbackForwardResp => FLAG_TERMINAL,
             Self::ExecRequest | Self::FsRequest => FLAG_SESSION_START,
             Self::Shutdown => FLAG_SHUTDOWN,
             _ => 0,
@@ -193,6 +228,10 @@ impl MessageType {
             Self::FsRequest => "core.fs.request",
             Self::FsResponse => "core.fs.response",
             Self::FsData => "core.fs.data",
+            Self::PortEvent => "host.port.event",
+            Self::LoopbackForward => "guest.loopback.forward",
+            Self::LoopbackForwardCancel => "guest.loopback.forward.cancel",
+            Self::LoopbackForwardResp => "guest.loopback.forward.resp",
         }
     }
 
@@ -214,6 +253,10 @@ impl MessageType {
             "core.fs.request" => Some(Self::FsRequest),
             "core.fs.response" => Some(Self::FsResponse),
             "core.fs.data" => Some(Self::FsData),
+            "host.port.event" => Some(Self::PortEvent),
+            "guest.loopback.forward" => Some(Self::LoopbackForward),
+            "guest.loopback.forward.cancel" => Some(Self::LoopbackForwardCancel),
+            "guest.loopback.forward.resp" => Some(Self::LoopbackForwardResp),
             _ => None,
         }
     }
@@ -341,6 +384,13 @@ mod tests {
         assert_eq!(MessageType::ExecResize.flags(), 0);
         assert_eq!(MessageType::ExecSignal.flags(), 0);
         assert_eq!(MessageType::FsData.flags(), 0);
+        // Loopback RPCs are one-shot, not sessions — the relay must
+        // not register their correlation IDs into active_sessions.
+        assert_eq!(MessageType::LoopbackForward.flags(), 0);
+        assert_eq!(MessageType::LoopbackForwardCancel.flags(), 0);
+        // The reply is still terminal so the SDK client drops the
+        // pending-map subscription.
+        assert_eq!(MessageType::LoopbackForwardResp.flags(), FLAG_TERMINAL);
     }
 
     #[test]
