@@ -702,6 +702,7 @@ type MountConfig struct {
 	Format   string
 	Fstype   string
 	Readonly bool
+	Noexec   bool
 	SizeMiB  uint32
 
 	// StatVirtualization is the per-mount stat-virtualization policy. Only
@@ -739,6 +740,7 @@ func (m MountConfig) Kind() MountKind { return m.kind }
 // preserve the conservative defaults (Strict + Private).
 type MountOptions struct {
 	Readonly           bool
+	Noexec             bool
 	StatVirtualization StatVirtualization
 	HostPermissions    HostPermissions
 }
@@ -747,6 +749,7 @@ type MountOptions struct {
 type TmpfsOptions struct {
 	SizeMiB  uint32
 	Readonly bool
+	Noexec   bool
 }
 
 // DiskOptions tunes the Disk factory.
@@ -756,6 +759,7 @@ type DiskOptions struct {
 	// Fstype hint ("ext4", "xfs"). Optional.
 	Fstype   string
 	Readonly bool
+	Noexec   bool
 }
 
 // mountFactory is the factory namespace for constructing MountConfig values.
@@ -776,6 +780,7 @@ func (mountFactory) Bind(hostPath string, opts MountOptions) MountConfig {
 		kind:               MountKindBind,
 		Bind:               hostPath,
 		Readonly:           opts.Readonly,
+		Noexec:             opts.Noexec,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
 	}
@@ -787,6 +792,7 @@ func (mountFactory) Named(name string, opts MountOptions) MountConfig {
 		kind:               MountKindNamed,
 		Named:              name,
 		Readonly:           opts.Readonly,
+		Noexec:             opts.Noexec,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
 	}
@@ -794,7 +800,13 @@ func (mountFactory) Named(name string, opts MountOptions) MountConfig {
 
 // Tmpfs returns a MountConfig that mounts an ephemeral in-memory filesystem.
 func (mountFactory) Tmpfs(opts TmpfsOptions) MountConfig {
-	return MountConfig{kind: MountKindTmpfs, Tmpfs: true, SizeMiB: opts.SizeMiB, Readonly: opts.Readonly}
+	return MountConfig{
+		kind:     MountKindTmpfs,
+		Tmpfs:    true,
+		SizeMiB:  opts.SizeMiB,
+		Readonly: opts.Readonly,
+		Noexec:   opts.Noexec,
+	}
 }
 
 // Disk mounts a host disk image at the given guest path.
@@ -805,6 +817,7 @@ func (mountFactory) Disk(hostPath string, opts DiskOptions) MountConfig {
 		Format:   opts.Format,
 		Fstype:   opts.Fstype,
 		Readonly: opts.Readonly,
+		Noexec:   opts.Noexec,
 	}
 }
 

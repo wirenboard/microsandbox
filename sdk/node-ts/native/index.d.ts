@@ -351,9 +351,9 @@ export type JsMetricsStream = MetricsStream
  * Fluent builder for a sandbox volume mount.
  *
  * Pick exactly one mount kind via `.bind()`, `.named()`, `.tmpfs()`, or
- * `.disk(...)`, then chain modifiers (`.readonly()`, `.size(mib)` for
- * tmpfs, `.format(fmt)` / `.fstype(s)` for disk). Validation is deferred
- * to the terminal `.build()` call.
+ * `.disk(...)`, then chain modifiers (`.readonly()`, `.noexec()`,
+ * `.size(mib)` for tmpfs, `.format(fmt)` / `.fstype(s)` for disk).
+ * Validation is deferred to the terminal `.build()` call.
  */
 export declare class MountBuilder {
   constructor(guest: string)
@@ -374,6 +374,8 @@ export declare class MountBuilder {
   fstype(fstype: string): this
   /** Mark the mount read-only. */
   readonly(): this
+  /** Prevent direct execution from the mount. */
+  noexec(): this
   /** Tmpfs size cap in MiB (only valid with `.tmpfs()`). */
   size(mib: number): this
   /**
@@ -391,8 +393,8 @@ export declare class MountBuilder {
    */
   hostPermissions(policy: string): this
   /**
-   * Materialize the mount spec. Returns a flat `BuiltVolumeMount`
-   * with a `kind` discriminator and per-variant fields.
+   * Materialize the mount spec. Returns a flat `VolumeMount` with a
+   * `kind` discriminator and per-variant fields.
    */
   build(): VolumeMount
 }
@@ -2012,6 +2014,7 @@ export interface VolumeMount {
   kind: string
   guest: string
   readonly: boolean
+  noexec: boolean
   host?: string
   name?: string
   sizeMib?: number
