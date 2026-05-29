@@ -165,6 +165,12 @@ struct InboundConnection {
 /// after the relay task has exited before force-aborting the socket.
 const DEFERRED_CLOSE_LIMIT: u16 = 64;
 
+/// Initial backoff after an `accept()` failure in `run_accept_loop`.
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
+
+/// Cap on the exponential backoff between `accept()` failures.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
 /// A single inbound connection relay (host socket ↔ smoltcp socket).
 struct InboundRelay {
     handle: SocketHandle,
@@ -422,11 +428,23 @@ impl PortPublisher {
 
     /// Boot-time listener spawn for a declared `--publish` port.
     ///
-    /// The accept-loop task does its own `TcpListener::bind` because
-    /// `PortPublisher::new` runs on the smoltcp poll thread, which is
-    /// not a tokio context. Wrapping the bind inside the spawned
-    /// task keeps everything async-clean. Returns `None` for non-TCP
-    /// ports (UDP listener support is still TODO).
+    /// Binds synchronously (via `std::net::TcpListener::bind` +
+    /// `tokio::net::TcpListener::from_std`) so the caller can
+    /// distinguish bind success from failure BEFORE registering an
+    /// `AbortHandle` in `listener_handles`. Without that ordering, a
+    /// failed bind would still leave the (host_bind, host_port) key
+    /// occupied in the handle map, blocking any future
+    /// `PortCommand::Add` for the same key forever (apply_command
+    /// rejects duplicates with `contains_key`).
+    ///
+    /// `PortPublisher::new` runs on the smoltcp poll thread, which
+    /// is not a tokio context — std bind + `from_std` lets us turn
+    /// the result into a tokio listener without entering the
+    /// runtime ourselves.
+    ///
+    /// Returns `None` for non-TCP ports (UDP listener support is
+    /// still TODO) and for binds that failed (the error is logged
+    /// here so callers don't have to).
     fn spawn_listener_one(
         port: &PublishedPort,
         inbound_tx: &mpsc::Sender<InboundConnection>,
@@ -438,27 +456,46 @@ impl PortPublisher {
             // TODO: UDP published ports.
             return None;
         }
-        let tx = inbound_tx.clone();
         let bind_addr = SocketAddr::new(port.host_bind, port.host_port);
-        let guest_port = port.guest_port;
-        let policy = policy.clone();
-        let shared = shared.clone();
-        let join = tokio_handle.spawn(async move {
-            let listener = match TcpListener::bind(bind_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(
-                        bind = %bind_addr,
-                        error = %e,
-                        "published port listener failed to bind",
-                    );
-                    return;
-                }
-            };
-            tracing::debug!(bind = %bind_addr, guest_port, "published port listener started");
-            run_accept_loop(listener, guest_port, tx, policy, shared).await;
-        });
-        Some(join.abort_handle())
+        let std_listener = match std::net::TcpListener::bind(bind_addr) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    bind = %bind_addr,
+                    error = %e,
+                    "published port listener failed to bind",
+                );
+                return None;
+            }
+        };
+        if let Err(e) = std_listener.set_nonblocking(true) {
+            tracing::error!(
+                bind = %bind_addr,
+                error = %e,
+                "published port listener: set_nonblocking failed",
+            );
+            return None;
+        }
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    bind = %bind_addr,
+                    error = %e,
+                    "published port listener: from_std failed",
+                );
+                return None;
+            }
+        };
+        tracing::debug!(bind = %bind_addr, guest_port = port.guest_port, "published port listener started");
+        Some(Self::spawn_accept_task(
+            listener,
+            port.guest_port,
+            inbound_tx.clone(),
+            policy.clone(),
+            shared.clone(),
+            tokio_handle,
+        ))
     }
 
     /// Runtime listener spawn from a pre-bound `TcpListener`. Used
@@ -502,6 +539,10 @@ impl PortPublisher {
 ///
 /// Returns when the publisher drops `inbound_tx` (so the parent
 /// poll loop is gone) or when the listener errors. Caller logs.
+///
+/// `accept()` errors get exponential backoff (capped) — `EMFILE` /
+/// `ENFILE` / `EBADF` are sticky and would otherwise hot-spin the
+/// loop. Backoff resets on the next successful accept.
 async fn run_accept_loop(
     listener: TcpListener,
     guest_port: u16,
@@ -509,11 +550,17 @@ async fn run_accept_loop(
     policy: Arc<NetworkPolicy>,
     shared: Arc<SharedState>,
 ) {
+    let mut backoff = ACCEPT_BACKOFF_INITIAL;
     loop {
         let (stream, peer) = match listener.accept().await {
-            Ok(p) => p,
+            Ok(p) => {
+                backoff = ACCEPT_BACKOFF_INITIAL;
+                p
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "published port: accept failed");
+                tracing::warn!(error = %e, ?backoff, "published port: accept failed, backing off");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
                 continue;
             }
         };
@@ -625,5 +672,76 @@ fn write_host_data(socket: &mut tcp::Socket<'_>, relay: &mut InboundRelay) {
             }
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PortProtocol;
+    use std::net::Ipv4Addr;
+
+    /// Regression for the "stale AbortHandle on bind failure" bug:
+    /// when the boot-time bind fails, spawn_listener_one must
+    /// return `None` so the caller doesn't register a dead handle
+    /// in `listener_handles`. Otherwise the (host_bind, host_port)
+    /// key would stay "occupied" forever and block every future
+    /// PortCommand::Add for that key.
+    #[tokio::test]
+    async fn spawn_listener_one_returns_none_when_bind_fails() {
+        // Bind the port first so the helper's bind fails.
+        let blocker = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = blocker.local_addr().unwrap().port();
+
+        let policy = Arc::new(NetworkPolicy::default());
+        let shared = Arc::new(SharedState::new(crate::shared::DEFAULT_QUEUE_CAPACITY));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pp = PublishedPort {
+            host_port: port,
+            guest_port: 80,
+            protocol: PortProtocol::Tcp,
+            host_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+        let handle =
+            PortPublisher::spawn_listener_one(&pp, &tx, &policy, &shared, &tokio::runtime::Handle::current());
+        assert!(handle.is_none(), "bind to a busy port must not register a handle");
+        drop(blocker);
+    }
+
+    /// Companion: a successful bind DOES return a handle, AND the
+    /// task that handle aborts is the accept loop (verified by
+    /// rebinding the same port after abort).
+    #[tokio::test]
+    async fn spawn_listener_one_returns_abortable_handle_on_success() {
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let policy = Arc::new(NetworkPolicy::default());
+        let shared = Arc::new(SharedState::new(crate::shared::DEFAULT_QUEUE_CAPACITY));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pp = PublishedPort {
+            host_port: port,
+            guest_port: 80,
+            protocol: PortProtocol::Tcp,
+            host_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+        let handle =
+            PortPublisher::spawn_listener_one(&pp, &tx, &policy, &shared, &tokio::runtime::Handle::current())
+                .expect("bind should succeed on free port");
+        handle.abort();
+        // Yield so the abort actually takes effect and the
+        // TcpListener inside the task drops, releasing the port.
+        tokio::task::yield_now().await;
+        // A best-effort rebind after a short retry — without
+        // SO_REUSEADDR the kernel may briefly hold the port in
+        // TIME_WAIT, but for a never-accepted listener the abort
+        // releases it immediately.
+        let rebound = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+        assert!(rebound.is_ok(), "port should be re-bindable after abort");
     }
 }

@@ -59,16 +59,36 @@ pub fn spawn(
     event_broadcast: Arc<dyn EventBroadcast>,
 ) {
     runtime.spawn(async move {
-        if let Err(e) = run(
-            &agent_sock_path,
-            &cfg,
-            &port_handle,
-            guest_ipv4,
-            &*event_broadcast,
-        )
-        .await
-        {
-            tracing::warn!(?e, "auto-publish task exited");
+        // Supervisor: re-establish the loopback UDS connection
+        // after stream-level errors so a transient hiccup (broken
+        // pipe, partial frame, malformed reply) doesn't silently
+        // disable auto-publish for the sandbox's lifetime. Each
+        // `run()` invocation creates a fresh UDS connection +
+        // handshake; on its own Err return we wait `restart_delay`
+        // and try again. `port_handle.send(...)` failing — the
+        // PortPublisher / smoltcp stack is gone — is the only
+        // sentinel for permanent shutdown; `run()` returns Ok in
+        // that case and we don't restart.
+        let restart_delay = Duration::from_millis(1000);
+        loop {
+            match run(
+                &agent_sock_path,
+                &cfg,
+                &port_handle,
+                guest_ipv4,
+                &*event_broadcast,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::debug!("auto-publish: clean shutdown");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "auto-publish: connection lost, reconnecting");
+                    tokio::time::sleep(restart_delay).await;
+                }
+            }
         }
     });
 }
@@ -93,6 +113,40 @@ struct ActiveMapping {
     host_bind: IpAddr,
     host_port: u16,
     has_loopback_forwarder: bool,
+}
+
+/// Monotonic id allocator clamped within the relay-assigned slot
+/// range. Without the clamp a raw `wrapping_add(1)` could carry us
+/// past `id_max` into a neighbouring slot's range, and the relay
+/// would route our FsResponse / LoopbackForwardResp to the wrong
+/// client. Mirrors the math in `AgentClient::next_id`.
+pub(crate) struct IdCounter {
+    next: u32,
+    min: u32,
+    max: u32,
+}
+
+impl IdCounter {
+    pub(crate) fn new(min: u32, max: u32) -> Self {
+        debug_assert!(min < max);
+        Self {
+            next: min,
+            min,
+            max,
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> u32 {
+        let id = self.next;
+        // `>=` so `max` itself is excluded — that boundary value
+        // belongs to the next slot under `frame.id / ID_RANGE_STEP`.
+        self.next = if self.next.saturating_add(1) >= self.max {
+            self.min
+        } else {
+            self.next + 1
+        };
+        id
+    }
 }
 
 async fn run(
@@ -133,9 +187,18 @@ async fn run(
     // to spawn an in-guest forwarder for this port (so we can
     // cancel it on teardown).
     let mut active: HashMap<u16, ActiveMapping> = HashMap::new();
-    // Start at id_offset + 1; id_offset itself is reserved (the
-    // relay's id-range math treats `id == 0` as "unassigned").
-    let mut next_req_id: u32 = id_offset + 1;
+    // ID counter for our slot's range. Must stay within
+    // `[id_offset + 1, id_offset + ID_RANGE_STEP)` — the relay
+    // routes replies by `frame.id / ID_RANGE_STEP`, so a wrap
+    // past our slot's upper bound would deliver responses to
+    // somebody else's slot and we'd block forever on a reply
+    // that went to the wrong client (or worse, collide with
+    // `PORT_EVENT_BROADCAST_ID` and trip the SDK's PortEvent
+    // decoder). Mirrors `AgentClient::next_id`'s clamp logic.
+    let id_range_step: u32 = u32::MAX / 16;
+    let id_min = id_offset + 1;
+    let id_max = id_offset.saturating_add(id_range_step);
+    let mut next_req_id: IdCounter = IdCounter::new(id_min, id_max);
 
     loop {
         sleep(poll).await;
@@ -170,7 +233,54 @@ async fn run(
             .collect();
         let wanted = collapse_listeners(&listening);
 
-        // ADD: ports newly listening that we haven't mirrored yet.
+        // RECONCILE: ports present in BOTH active and wanted but
+        // whose loopback flag flipped (e.g. dev-server restart
+        // switched `--host 0.0.0.0` → `--host 127.0.0.1` or
+        // vice-versa). Without re-evaluation, the latched
+        // `has_loopback_forwarder` from the first detection would
+        // either leave an agentd forwarder un-spawned (loopback
+        // case → smoltcp dials a NIC address with no listener) or
+        // leave one running pointlessly (wildcard case). Tear the
+        // stale mapping down here so the ADD phase below
+        // re-creates it with the correct state.
+        let mutated: Vec<u16> = active
+            .iter()
+            .filter_map(|(port, mapping)| {
+                wanted.get(port).and_then(|wanted_lb| {
+                    (mapping.has_loopback_forwarder != *wanted_lb).then_some(*port)
+                })
+            })
+            .collect();
+        for guest_port in mutated {
+            if let Some(mapping) = active.remove(&guest_port) {
+                tracing::info!(
+                    guest_port,
+                    host_port = mapping.host_port,
+                    "auto-publish: bind mode changed; rebuilding mapping",
+                );
+                let _ = port_handle.send(PortCommand::Remove {
+                    host_bind: mapping.host_bind,
+                    host_port: mapping.host_port,
+                });
+                if mapping.has_loopback_forwarder {
+                    let _ = send_loopback_cancel(
+                        guest_port,
+                        &mut next_req_id,
+                        &mut write_half,
+                        &mut buf_read,
+                    )
+                    .await;
+                }
+                broadcast.broadcast_port_event(PortEvent::Removed {
+                    host_bind: mapping.host_bind,
+                    host_port: mapping.host_port,
+                    guest_port,
+                });
+            }
+        }
+
+        // ADD: ports newly listening that we haven't mirrored yet
+        // (including ones torn down above by the RECONCILE pass).
         let new_ports: Vec<(u16, bool)> = wanted
             .iter()
             .filter(|(p, _)| !active.contains_key(p))
@@ -351,12 +461,11 @@ async fn connect_with_retry(path: &PathBuf) -> std::io::Result<UnixStream> {
 
 async fn read_proc(
     path: &str,
-    next_req_id: &mut u32,
+    next_req_id: &mut IdCounter,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     read_half: &mut BufReader<&mut tokio::net::unix::OwnedReadHalf>,
 ) -> std::io::Result<String> {
-    let id = *next_req_id;
-    *next_req_id = next_req_id.wrapping_add(1);
+    let id = next_req_id.next();
     let req = FsRequest {
         op: FsOp::Read {
             path: path.to_string(),
@@ -396,7 +505,7 @@ async fn read_proc(
 async fn send_loopback_forward(
     bind_addr: IpAddr,
     port: u16,
-    next_req_id: &mut u32,
+    next_req_id: &mut IdCounter,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     read_half: &mut BufReader<&mut tokio::net::unix::OwnedReadHalf>,
 ) -> std::io::Result<()> {
@@ -413,7 +522,7 @@ async fn send_loopback_forward(
 
 async fn send_loopback_cancel(
     port: u16,
-    next_req_id: &mut u32,
+    next_req_id: &mut IdCounter,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     read_half: &mut BufReader<&mut tokio::net::unix::OwnedReadHalf>,
 ) -> std::io::Result<()> {
@@ -431,12 +540,11 @@ async fn send_loopback_cancel(
 async fn send_loopback_req<T: serde::Serialize>(
     msg_type: MessageType,
     payload: &T,
-    next_req_id: &mut u32,
+    next_req_id: &mut IdCounter,
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     read_half: &mut BufReader<&mut tokio::net::unix::OwnedReadHalf>,
 ) -> std::io::Result<()> {
-    let id = *next_req_id;
-    *next_req_id = next_req_id.wrapping_add(1);
+    let id = next_req_id.next();
     let msg = Message::with_payload(msg_type, id, payload).map_err(io_err)?;
     write_message(write_half, &msg).await.map_err(io_err)?;
 
@@ -558,5 +666,33 @@ mod tests {
         assert_eq!(out.get(&7001), Some(&true));
         assert_eq!(out.get(&7002), Some(&false));
         assert_eq!(out.get(&7003), Some(&true));
+    }
+
+    /// Regression for the wrap bug: a u32 counter that does
+    /// `wrapping_add(1)` would carry past id_max into a
+    /// neighbouring slot's range. IdCounter must wrap to id_min
+    /// instead.
+    #[test]
+    fn id_counter_wraps_at_max_back_to_min() {
+        let mut c = IdCounter::new(100, 105);
+        assert_eq!(c.next(), 100);
+        assert_eq!(c.next(), 101);
+        assert_eq!(c.next(), 102);
+        assert_eq!(c.next(), 103);
+        // saturating_add(1) >= max → wrap; 104 + 1 == 105 == max,
+        // so the very next call wraps.
+        assert_eq!(c.next(), 104);
+        assert_eq!(c.next(), 100);
+        assert_eq!(c.next(), 101);
+    }
+
+    /// Edge: counter saturates at u32::MAX without panic.
+    #[test]
+    fn id_counter_handles_u32_max_window() {
+        let mut c = IdCounter::new(u32::MAX - 2, u32::MAX);
+        assert_eq!(c.next(), u32::MAX - 2);
+        // u32::MAX - 1 + 1 == u32::MAX == max → wrap
+        assert_eq!(c.next(), u32::MAX - 1);
+        assert_eq!(c.next(), u32::MAX - 2);
     }
 }

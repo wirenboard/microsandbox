@@ -190,16 +190,21 @@ impl Message {
 
 impl MessageType {
     /// Computes the frame flags byte for this message type.
+    ///
+    /// `LoopbackForward` and `LoopbackForwardCancel` are intentionally
+    /// NOT marked `FLAG_SESSION_START` — they're one-shot RPCs,
+    /// not streaming sessions, so the relay shouldn't register
+    /// their correlation IDs into `client.active_sessions`. The
+    /// matching `LoopbackForwardResp` still carries `FLAG_TERMINAL`
+    /// so the SDK client's pending-map subscription is removed
+    /// after the reply is delivered.
     pub fn flags(&self) -> u8 {
         match self {
             Self::ExecExited
             | Self::ExecFailed
             | Self::FsResponse
             | Self::LoopbackForwardResp => FLAG_TERMINAL,
-            Self::ExecRequest
-            | Self::FsRequest
-            | Self::LoopbackForward
-            | Self::LoopbackForwardCancel => FLAG_SESSION_START,
+            Self::ExecRequest | Self::FsRequest => FLAG_SESSION_START,
             Self::Shutdown => FLAG_SHUTDOWN,
             _ => 0,
         }
@@ -379,6 +384,13 @@ mod tests {
         assert_eq!(MessageType::ExecResize.flags(), 0);
         assert_eq!(MessageType::ExecSignal.flags(), 0);
         assert_eq!(MessageType::FsData.flags(), 0);
+        // Loopback RPCs are one-shot, not sessions — the relay must
+        // not register their correlation IDs into active_sessions.
+        assert_eq!(MessageType::LoopbackForward.flags(), 0);
+        assert_eq!(MessageType::LoopbackForwardCancel.flags(), 0);
+        // The reply is still terminal so the SDK client drops the
+        // pending-map subscription.
+        assert_eq!(MessageType::LoopbackForwardResp.flags(), FLAG_TERMINAL);
     }
 
     #[test]
