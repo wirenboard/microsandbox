@@ -760,4 +760,58 @@ mod tests {
             "allow_egress_group(Private) must NOT open Metadata"
         );
     }
+
+    #[test]
+    fn allow_egress_group_host_opens_the_gateway_only() {
+        // --allow-host on the agent-vm side maps to this. The
+        // gateway IP is the one resolve_host_dst rewrites to host
+        // loopback, so allowing the Host group is what makes
+        // `host.microsandbox.internal:<port>` actually reach the
+        // host's `127.0.0.1:<port>`.
+        use crate::policy::{Action, Protocol};
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let shared = std::sync::Arc::new(crate::shared::SharedState::new(
+            crate::shared::DEFAULT_QUEUE_CAPACITY,
+        ));
+        // Pretend boot has set the per-sandbox gateway IPs; addr_classify
+        // returns Host only for these exact addresses (it checks against
+        // SharedState).
+        let gw_v4 = Ipv4Addr::new(172, 16, 0, 1);
+        let gw_v6: Ipv6Addr = "fd42:6d73:62::1".parse().unwrap();
+        shared.set_gateway_ips(Some(gw_v4), Some(gw_v6));
+
+        let cfg = NetworkBuilder::new()
+            .allow_egress_group(DestinationGroup::Host)
+            .build()
+            .unwrap();
+
+        // The gateway IPs (both families) become reachable.
+        for target in [
+            SocketAddr::new(gw_v4.into(), 8080),
+            SocketAddr::new(gw_v6.into(), 8080),
+        ] {
+            assert_eq!(
+                cfg.policy
+                    .evaluate_egress(target, Protocol::Tcp, &shared),
+                Action::Allow,
+                "allow_egress_group(Host) must allow gateway {target}"
+            );
+        }
+
+        // Non-gateway addresses in the same CIDR are still classified
+        // as Private (or whatever), NOT Host, so they remain denied.
+        let lan: SocketAddr = "172.16.0.42:80".parse().unwrap();
+        assert_eq!(
+            cfg.policy.evaluate_egress(lan, Protocol::Tcp, &shared),
+            Action::Deny,
+            "allow_egress_group(Host) must NOT open the rest of the LAN"
+        );
+        let host_loopback: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        assert_eq!(
+            cfg.policy
+                .evaluate_egress(host_loopback, Protocol::Tcp, &shared),
+            Action::Deny,
+            "allow_egress_group(Host) must NOT open the guest's own loopback"
+        );
+    }
 }
