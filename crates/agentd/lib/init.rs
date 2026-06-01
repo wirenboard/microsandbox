@@ -17,13 +17,20 @@ use crate::{network, rlimit, tls};
 ///
 /// Consumes the [`BootParams`] by value — the data is one-shot and not
 /// needed after init returns.
-pub fn init(params: BootParams) -> AgentdResult<()> {
+pub fn init(mut params: BootParams) -> AgentdResult<()> {
     rlimit::apply_baseline(&params.rlimits)?;
     linux::mount_filesystems()?;
     linux::mount_runtime()?;
     if let Some(spec) = &params.block_root {
         linux::mount_block_root(spec)?;
     }
+    // The path-bearing mount specs (dir/file/disk) travel via the runtime
+    // virtiofs share, not the kernel command line — the cmdline can't carry
+    // a non-ASCII or whitespace guest path without panicking the VMM. Read
+    // them now: the runtime fs is mounted (and `mount_block_root` has bound
+    // it into the pivoted root), and we're still before the mounts are
+    // applied. An absent file is a no-op (back-compat).
+    params.overlay_boot_params_file()?;
     linux::apply_dir_mounts(&params.dir_mounts)?;
     linux::apply_file_mounts(&params.file_mounts)?;
     linux::apply_disk_mounts(&params.disk_mounts)?;

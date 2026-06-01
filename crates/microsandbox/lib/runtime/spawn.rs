@@ -564,21 +564,34 @@ fn encode_rlimits(rlimits: &[Rlimit]) -> String {
 /// mangling collides for adversarial inputs (`/var/log` and `/var_log` both
 /// produce `var_log`), so we append a short sha256-derived suffix.
 ///
-/// Output is at most 20 bytes — the kernel's virtio-blk serial length limit.
-/// Layout: `<slug[..11]>_<8-hex>`. The slug-part is a debugging hint; the
-/// 8-hex suffix is what actually disambiguates.
+/// Output is at most 20 BYTES — both the kernel's virtio-blk serial length
+/// limit (`VIRTIO_BLK_ID_BYTES`, hard-truncated by the block device) and
+/// well within the 36-byte virtio-fs tag field (which is filled with an
+/// unguarded `config.tag[..tag.len()].copy_from_slice(...)`, so an
+/// over-length tag would *panic* the VMM at device setup — not truncate).
+/// Layout: `<slug>_<8-hex>` where the slug is at most 11 bytes. The slug is
+/// a debugging hint; the 8-hex suffix is what actually disambiguates.
+///
+/// The slug budget is counted in BYTES (truncated on a UTF-8 char
+/// boundary), not chars: a `.chars().take(11)` cap lets an 11-codepoint
+/// multibyte path (e.g. Cyrillic = 2 bytes/char → 22, emoji = 4 → 44)
+/// blow past the 20-byte serial limit and the 36-byte fs-tag field. For
+/// pure-ASCII paths (the common case) byte- and char-counting coincide,
+/// so existing tags are unchanged.
 fn guest_mount_tag(guest_path: &str) -> String {
     use std::fmt::Write as _;
 
-    const SLUG_MAX: usize = 11;
+    const SLUG_MAX_BYTES: usize = 11;
     const HASH_HEX_LEN: usize = 8;
 
-    let slug: String = guest_path
-        .replace('/', "_")
-        .trim_start_matches('_')
-        .chars()
-        .take(SLUG_MAX)
-        .collect();
+    let mangled = guest_path.replace('/', "_");
+    let mut slug = String::with_capacity(SLUG_MAX_BYTES);
+    for c in mangled.trim_start_matches('_').chars() {
+        if slug.len() + c.len_utf8() > SLUG_MAX_BYTES {
+            break;
+        }
+        slug.push(c);
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(guest_path.as_bytes());
@@ -1453,6 +1466,50 @@ mod tests {
         let long = "/a/very/deeply/nested/guest/mount/point/that/exceeds/the/slug/cap";
         let tag = super::guest_mount_tag(long);
         assert!(tag.len() <= 20, "tag {tag:?} exceeds 20 bytes");
+    }
+
+    #[tokio::test]
+    async fn test_guest_mount_tag_multibyte_fits_byte_limit() {
+        // The slug budget is counted in BYTES on a char boundary, so
+        // multibyte guest paths must still produce a <=20-byte tag that
+        // fits the virtio-blk serial AND the 36-byte virtio-fs tag field
+        // (the latter copies without a min() guard, so an over-length
+        // tag would panic the VMM at device setup). A `.chars().take(11)`
+        // cap would yield 22 bytes (Cyrillic) / 44 bytes (emoji) here.
+        for path in [
+            "/home/boger/проект-тест",      // 2-byte UTF-8 (Cyrillic)
+            "/home/boger/😀😀😀😀proj",     // 4-byte UTF-8 (emoji)
+            "/проект/вложенный/каталог",
+        ] {
+            let tag = super::guest_mount_tag(path);
+            assert!(
+                tag.as_bytes().len() <= 20,
+                "tag {tag:?} for {path:?} exceeds 20 bytes ({} bytes)",
+                tag.as_bytes().len()
+            );
+            // Always a valid string with the hex suffix present.
+            assert!(tag.is_char_boundary(tag.len()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_guest_mount_tag_ascii_unchanged_by_byte_cap() {
+        // Byte- and char-counting coincide for ASCII, so switching the
+        // slug cap from chars to bytes must not move any existing tag.
+        // These are golden values (slug + '_' + 8 hex of sha256(path));
+        // the agent-vm-state one matches what ships in MSB_DIR_MOUNTS
+        // today, so a regression that shifted ASCII tags would break
+        // mount-tag agreement between msb and agentd on a live VM.
+        for (path, expected) in [
+            ("/data", "data_bd47413b"),
+            ("/var/log", "var_log_9a6a409e"),
+            ("/agent-vm-state", "agent-vm-st_93b66b7e"),
+            ("/workspace", "workspace_c52ddf65"),
+            // 11-char ASCII slug boundary: exactly 11 bytes either way.
+            ("/abcdefghijklmnop", "abcdefghijk_dca0d950"),
+        ] {
+            assert_eq!(super::guest_mount_tag(path), expected, "tag for {path:?}");
+        }
     }
 
     #[tokio::test]

@@ -19,10 +19,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use microsandbox_protocol::{
-    ENV_BLOCK_ROOT, ENV_DIR_MOUNTS, ENV_DISK_MOUNTS, ENV_FILE_MOUNTS, ENV_HANDOFF_INIT,
-    ENV_HANDOFF_INIT_ARGS, ENV_HANDOFF_INIT_ENV, ENV_HOST_ALIAS, ENV_HOSTNAME, ENV_NET,
-    ENV_NET_IPV4, ENV_NET_IPV6, ENV_RLIMITS, ENV_TMPFS, ENV_USER, HANDOFF_INIT_AUTO,
-    HANDOFF_INIT_SEP, exec::ExecRlimit,
+    BOOT_PARAMS_FILE, ENV_BLOCK_ROOT, ENV_DIR_MOUNTS, ENV_DISK_MOUNTS, ENV_FILE_MOUNTS,
+    ENV_HANDOFF_INIT, ENV_HANDOFF_INIT_ARGS, ENV_HANDOFF_INIT_ENV, ENV_HOST_ALIAS, ENV_HOSTNAME,
+    ENV_NET, ENV_NET_IPV4, ENV_NET_IPV6, ENV_RLIMITS, ENV_TMPFS, ENV_USER, HANDOFF_INIT_AUTO,
+    HANDOFF_INIT_SEP, RUNTIME_MOUNT_POINT, exec::ExecRlimit,
 };
 
 use crate::error::{AgentdError, AgentdResult};
@@ -39,7 +39,7 @@ use crate::rlimit;
 /// accidental reads after init completes.
 ///
 /// [`init::init`]: crate::init::init
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BootParams {
     /// Parsed `MSB_BLOCK_ROOT` — block device for rootfs switch.
     pub(crate) block_root: Option<BlockRootSpec>,
@@ -254,6 +254,63 @@ impl BootParams {
                 .unwrap_or_default(),
             handoff_init: parse_handoff_init()?,
         })
+    }
+
+    /// Overlay path-bearing mount specs from the boot-params side channel.
+    ///
+    /// The host writes the dir/file/disk mount specs (those whose values
+    /// embed an absolute guest path) to
+    /// `<RUNTIME_MOUNT_POINT>/<BOOT_PARAMS_FILE>` instead of the kernel
+    /// command line, because the cmdline is printable-ASCII-only and would
+    /// reject — and panic the VMM on — a non-ASCII or whitespace guest path
+    /// (see [`BOOT_PARAMS_FILE`]). Those `MSB_*` keys are therefore *absent*
+    /// from the cmdline env, so [`Self::from_env`] leaves the corresponding
+    /// fields empty; this method fills them from the file.
+    ///
+    /// Must be called only after the runtime filesystem is mounted (the file
+    /// lives on the `msb_runtime` virtiofs share). An absent file is a no-op
+    /// — back-compat with a host that didn't relocate these vars, in which
+    /// case `from_env` already parsed them off the cmdline. Malformed content
+    /// is a hard [`AgentdError`] (never a panic), preserving the
+    /// no-panic-at-boot contract.
+    pub fn overlay_boot_params_file(&mut self) -> AgentdResult<()> {
+        let path = PathBuf::from(RUNTIME_MOUNT_POINT).join(BOOT_PARAMS_FILE);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(AgentdError::Config(format!(
+                    "reading boot-params {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        self.overlay_boot_params(&content)
+    }
+
+    /// Parse the `KEY\tVALUE\n` boot-params body and overlay the
+    /// path-bearing mount specs. Pure (no I/O) for testability; see
+    /// [`Self::overlay_boot_params_file`] for the read side.
+    fn overlay_boot_params(&mut self, content: &str) -> AgentdResult<()> {
+        for line in content.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let (key, value) = line.split_once('\t').ok_or_else(|| {
+                AgentdError::Config(format!("boot-params line missing TAB separator: {line:?}"))
+            })?;
+            // Only the path-bearing keys are expected here; ignore any
+            // others for forward-compat. Values are parsed by the same
+            // routines that handle the cmdline form, so ASCII specs behave
+            // identically whichever transport they arrived on.
+            match key {
+                ENV_DIR_MOUNTS => self.dir_mounts = parse_dir_mounts(value)?,
+                ENV_FILE_MOUNTS => self.file_mounts = parse_file_mounts(value)?,
+                ENV_DISK_MOUNTS => self.disk_mounts = parse_disk_mounts(value)?,
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Take the handoff-init spec out of the boot params.
@@ -864,6 +921,60 @@ fn read_env_raw(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Boot-params side channel ──────────────────────────────────────
+
+    #[test]
+    fn overlay_boot_params_parses_non_ascii_guest_path() {
+        // Mirrors exactly what the host producer writes: `KEY\tVALUE\n`
+        // lines, value byte-verbatim. A Cyrillic guest path must round-trip
+        // intact (this is the whole point of the side channel — the cmdline
+        // couldn't carry it).
+        let tag = "home_boger__bdfd1622";
+        let content = format!(
+            "{ENV_DIR_MOUNTS}\t{tag}:/home/boger/проект;st_1:/agent-vm-state\n\
+             {ENV_DISK_MOUNTS}\tdata_1:/data:ext4\n"
+        );
+        let mut params = BootParams::default();
+        params.overlay_boot_params(&content).expect("overlay ok");
+
+        assert_eq!(params.dir_mounts.len(), 2);
+        assert_eq!(params.dir_mounts[0].tag, tag);
+        assert_eq!(params.dir_mounts[0].guest_path, "/home/boger/проект");
+        assert_eq!(params.dir_mounts[1].guest_path, "/agent-vm-state");
+        assert_eq!(params.disk_mounts.len(), 1);
+        assert_eq!(params.disk_mounts[0].guest_path, "/data");
+        // file_mounts absent in the body → stays empty.
+        assert!(params.file_mounts.is_empty());
+    }
+
+    #[test]
+    fn overlay_boot_params_space_in_guest_path_round_trips() {
+        // Whitespace in the guest path survives the TAB-framed channel
+        // (the cmdline would have tokenized it).
+        let content = format!("{ENV_DIR_MOUNTS}\ttag_1:/home/My Project\n");
+        let mut params = BootParams::default();
+        params.overlay_boot_params(&content).expect("overlay ok");
+        assert_eq!(params.dir_mounts[0].guest_path, "/home/My Project");
+    }
+
+    #[test]
+    fn overlay_boot_params_rejects_line_without_tab() {
+        // Producer/consumer drift (a line lacking the TAB separator) is a
+        // hard error, never a panic.
+        let mut params = BootParams::default();
+        let err = params
+            .overlay_boot_params(&format!("{ENV_DIR_MOUNTS} tag:/x\n"))
+            .expect_err("missing-tab line must error");
+        assert!(matches!(err, AgentdError::Config(_)));
+    }
+
+    #[test]
+    fn overlay_boot_params_empty_is_noop() {
+        let mut params = BootParams::default();
+        params.overlay_boot_params("").expect("empty ok");
+        assert!(params.dir_mounts.is_empty());
+    }
 
     // ── Block Root ────────────────────────────────────────────────────
 
