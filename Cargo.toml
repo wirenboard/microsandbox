@@ -111,6 +111,10 @@ tar = "0.4"
 time = "0.3"
 tempfile = "3.15"
 thiserror = "2.0"
+# jemalloc for the `msb` binary — replaces glibc malloc, whose per-arena
+# heaps balloon host RSS on many-core hosts (see crates/cli). `background_threads`
+# makes jemalloc purge freed pages back to the OS while the process is idle.
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 tokio = { version = "1.42", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"

@@ -12,6 +12,25 @@ use microsandbox_cli::{
     sandbox_cmd::{self, SandboxArgs},
 };
 
+/// Replace glibc malloc with jemalloc on Unix.
+///
+/// The `msb sandbox` supervisor is a tokio multi-threaded VMM + network
+/// proxy. On many-core hosts, glibc's malloc keeps up to `8 * ncpu`
+/// per-thread arenas, each of which can grow a 64 MiB heap and never
+/// returns it to the OS once the pages are touched. Under the bursty
+/// concurrent allocation of the network stack (smoltcp, rustls, hickory
+/// DNS, proxy buffers) the host RSS balloons to 10-20+ GiB even for a
+/// sandbox launched with `--memory 4` — the guest RAM is a separate,
+/// correctly-capped mapping, so this is pure allocator retention.
+///
+/// jemalloc (with `background_threads`) purges freed pages back to the OS,
+/// so host RSS tracks the live working set instead of the high-water mark.
+/// Kept Rust-side (default symbol prefix); libkrun's C allocations are
+/// unaffected and the measured balloon is entirely Rust-side anyway.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
