@@ -386,6 +386,13 @@ impl AgentClient {
         self.negotiated_version
     }
 
+    /// The runtime's self-reported package version, taken from its `core.ready`
+    /// frame. Empty when the runtime predates this field (an older agent), in
+    /// which case fall back to the generation for diagnostics.
+    pub fn agent_version(&self) -> &str {
+        &self.ready.agent_version
+    }
+
     /// Whether the connected sandbox is new enough to handle the given message
     /// type. The single source of truth for feature gating: callers that can't
     /// gate by sending (e.g. the SSH/SFTP layer) consult this instead of
@@ -406,13 +413,12 @@ impl AgentClient {
     /// The single place the rule lives. Exposed for callers that hold the
     /// negotiated generation but not the live client (e.g. the SSH/SFTP layer).
     pub fn ensure_version_compat_for(t: MessageType, negotiated: u8) -> AgentClientResult<()> {
-        let needs = t.min_protocol_version();
-        if needs <= negotiated {
+        if t.is_available_at(negotiated) {
             return Ok(());
         }
         Err(AgentClientError::UnsupportedOperation {
             msg_type: t.as_str(),
-            needs,
+            needs: t.min_protocol_version(),
             peer: negotiated,
         })
     }
@@ -639,6 +645,7 @@ fn encode_message_body<T: Serialize>(
 mod tests {
     use microsandbox_protocol::core::Ready;
     use microsandbox_protocol::exec::ExecRequest;
+    use microsandbox_protocol::message::PROTOCOL_VERSION;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
     use tokio::sync::oneshot;
@@ -654,6 +661,7 @@ mod tests {
             boot_time_ns: 11,
             init_time_ns: 22,
             ready_time_ns: 33,
+            agent_version: "9.9.9".to_string(),
         };
         let ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
 
@@ -676,6 +684,8 @@ mod tests {
         // Both peers speak the current generation, so that is what is negotiated.
         assert_eq!(client.negotiated_version(), PROTOCOL_VERSION);
         assert!(client.supports(MessageType::FsRequest));
+        // The runtime's self-reported version round-trips from the ready frame.
+        assert_eq!(client.agent_version(), "9.9.9");
         let decoded = client.ready().unwrap();
         assert_eq!(decoded.boot_time_ns, ready.boot_time_ns);
         assert_eq!(decoded.init_time_ns, ready.init_time_ns);
@@ -694,6 +704,7 @@ mod tests {
             boot_time_ns: 1,
             init_time_ns: 2,
             ready_time_ns: 3,
+            ..Default::default()
         };
         // A current-codec guest that advertises an older capability generation in
         // its ready frame (a runtime one generation behind this host).
@@ -779,6 +790,7 @@ mod tests {
             boot_time_ns: 11,
             init_time_ns: 22,
             ready_time_ns: 33,
+            ..Default::default()
         };
         let ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
         let id_offset = 268_435_455u32;
@@ -821,6 +833,42 @@ mod tests {
         assert_eq!(message.t, MessageType::ExecRequest);
     }
 
+    #[tokio::test]
+    async fn connect_preserves_current_peer_protocol_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let sock_path = temp.path().join("agent.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let ready = Ready {
+            boot_time_ns: 11,
+            init_time_ns: 22,
+            ready_time_ns: 33,
+            ..Default::default()
+        };
+        let mut ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
+        ready_msg.v = 2;
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&1u32.to_be_bytes()).await.unwrap();
+            socket
+                .write_all(&microsandbox_protocol::AGENT_RELAY_ID_RANGE_STEP.to_be_bytes())
+                .await
+                .unwrap();
+            codec::write_message(&mut socket, &ready_msg).await.unwrap();
+        });
+
+        let client =
+            AgentClient::connect_with_deadline(&sock_path, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(client.protocol(), AgentProtocol::Current);
+        // The runtime reported generation 2, so that is the negotiated capability.
+        assert_eq!(client.negotiated_version(), 2);
+        // TCP forwarding (generation 4) is unavailable to a generation-2 runtime.
+        assert!(!client.supports(MessageType::TcpConnect));
+    }
+
     async fn assert_accepts_legacy_relay_handshake(id_offset: u32) {
         let temp = tempfile::tempdir().unwrap();
         let sock_path = temp.path().join("agent.sock");
@@ -829,6 +877,7 @@ mod tests {
             boot_time_ns: 11,
             init_time_ns: 22,
             ready_time_ns: 33,
+            ..Default::default()
         };
         let ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
 
