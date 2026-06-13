@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
@@ -125,7 +124,13 @@ async fn tcp_proxy_task(
         }
     }
 
-    let stream = TcpStream::connect(connect_dst).await?;
+    // Tunnel through the host HTTP proxy when one is configured and applies to
+    // this destination, else connect directly. Host-alias connections are
+    // rewritten to loopback in `connect_dst`, which `endpoint_for` never
+    // proxies, so they always go direct.
+    let stream =
+        crate::http_proxy::connect_upstream(shared.proxy(), connect_dst, sni.as_deref(), false)
+            .await?;
     upstream_connected.store(true, Ordering::Release);
     let (mut server_rx, mut server_tx) = stream.into_split();
 
@@ -596,5 +601,70 @@ mod tests {
             .unwrap_or(HostnameSource::CacheOnly);
         let eval = policy.evaluate_egress_with_source(dst, Protocol::Tcp, &shared, source);
         assert_eq!(eval, EgressEvaluation::Deny);
+    }
+}
+
+#[cfg(test)]
+mod proxy_egress_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+
+    use crate::http_proxy::ProxyConfig;
+    use crate::http_proxy::test_support::{spawn_connect_proxy, spawn_echo_origin};
+    use crate::policy::{Action, NetworkPolicy};
+    use crate::shared::SharedState;
+
+    /// End-to-end: the real `tcp_proxy_task` must dial its upstream through the
+    /// configured host HTTP proxy via CONNECT, then relay bytes back to the
+    /// guest channel.
+    #[tokio::test]
+    async fn tcp_proxy_task_tunnels_through_http_proxy() {
+        let origin = spawn_echo_origin().await;
+        let (proxy_addr, authority_rx) = spawn_connect_proxy(origin).await;
+
+        let shared = Arc::new(SharedState::new(16));
+        shared.set_proxy(ProxyConfig::from_url(&format!("http://{proxy_addr}")).unwrap());
+
+        // No domain rules → the SYN-handler decision is authoritative and the
+        // task connects straight away.
+        let policy = Arc::new(NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![],
+        });
+
+        // Non-loopback dst so the proxy applies; the fixture proxy ignores the
+        // CONNECT authority and dials the real (loopback) origin.
+        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+
+        let (_guest_tx, guest_rx) = mpsc::channel::<Bytes>(8); // from_smoltcp
+        let (server_tx, mut server_rx) = mpsc::channel::<Bytes>(8); // to_smoltcp
+        let connected = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn(super::tcp_proxy_task(
+            dst,
+            dst,
+            guest_rx,
+            server_tx,
+            shared,
+            policy,
+            connected.clone(),
+        ));
+
+        // The origin sends its banner unprompted; it must arrive relayed.
+        let relayed = server_rx.recv().await.expect("relayed origin bytes");
+        assert_eq!(&relayed[..], b"HELLO-FROM-ORIGIN");
+
+        // The proxy was asked to reach our destination — proof the CONNECT
+        // path ran rather than a direct dial.
+        assert_eq!(authority_rx.await.unwrap(), "93.184.216.34:443");
+        assert!(connected.load(Ordering::Acquire));
+
+        // _guest_tx stays open; the task winds down on the origin's EOF.
+        let _ = task.await;
     }
 }

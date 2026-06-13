@@ -109,6 +109,7 @@ async fn tls_proxy_task(
         tracing::debug!(sni = %sni_name, dst = %dst, "TLS bypass");
         bypass_relay(
             dst,
+            &sni_name,
             initial_buf,
             from_smoltcp,
             to_smoltcp,
@@ -135,13 +136,17 @@ async fn tls_proxy_task(
 /// Bypass mode: plain TCP splice, no TLS termination.
 async fn bypass_relay(
     dst: SocketAddr,
+    sni_name: &str,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     upstream_connected: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let mut server = TcpStream::connect(dst).await?;
+    // Tunnel through the host HTTP proxy when configured (named by SNI so the
+    // proxy resolves the origin), else connect directly.
+    let mut server =
+        crate::http_proxy::connect_upstream(shared.proxy(), dst, Some(sni_name), true).await?;
     upstream_connected.store(true, Ordering::Release);
     server.write_all(&initial_buf).await?;
 
@@ -245,8 +250,11 @@ async fn intercept_relay(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
 
-    // Connect to real server with TLS.
-    let server_stream = TcpStream::connect(dst).await?;
+    // Connect to the real server — through the host HTTP proxy when configured
+    // (named by SNI), else directly. The upstream TLS handshake below then runs
+    // over the tunnel exactly as over a direct socket, so the MITM is intact.
+    let server_stream =
+        crate::http_proxy::connect_upstream(shared.proxy(), dst, Some(sni_name), true).await?;
     upstream_connected.store(true, Ordering::Release);
     let server_name = ServerName::try_from(sni_name.to_string())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
