@@ -8,7 +8,6 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::conn::ProxyConnectState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::secrets::config::{SecretsConfig, ViolationAction};
 use crate::secrets::handler::SecretsHandler;
@@ -47,10 +47,9 @@ const PEEK_BUDGET: Duration = Duration::from_secs(5);
 /// dials; for host-alias connections it's loopback (gateway rewritten).
 /// For everything else the two are identical.
 ///
-/// `upstream_connected` is flipped to `true` after the upstream
-/// `TcpStream::connect` succeeds. The connection tracker reads this
-/// on proxy exit to decide between FIN (clean close) and RST
-/// (upstream never reached, e.g. connect failure or policy denial).
+/// `proxy_connect` is updated before the task exits so the connection
+/// tracker can decide between FIN (clean close) and RST (upstream
+/// connect failure).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_tcp_proxy(
     handle: &tokio::runtime::Handle,
@@ -61,7 +60,7 @@ pub fn spawn_tcp_proxy(
     shared: Arc<SharedState>,
     network_policy: Arc<NetworkPolicy>,
     secrets: Arc<SecretsConfig>,
-    upstream_connected: Arc<AtomicBool>,
+    proxy_connect: Arc<ProxyConnectState>,
 ) {
     handle.spawn(async move {
         if let Err(e) = tcp_proxy_task(
@@ -72,7 +71,7 @@ pub fn spawn_tcp_proxy(
             shared,
             network_policy,
             secrets,
-            upstream_connected,
+            proxy_connect,
         )
         .await
         {
@@ -92,7 +91,7 @@ async fn tcp_proxy_task(
     shared: Arc<SharedState>,
     network_policy: Arc<NetworkPolicy>,
     secrets: Arc<SecretsConfig>,
-    upstream_connected: Arc<AtomicBool>,
+    proxy_connect: Arc<ProxyConnectState>,
 ) -> io::Result<()> {
     // Peek when:
     // - there are Domain/DomainSuffix rules that need SNI to refine egress, OR
@@ -123,10 +122,14 @@ async fn tcp_proxy_task(
                     source = source.label(),
                     "TCP egress denied by domain policy",
                 );
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
                 return Ok(());
             }
             EgressEvaluation::DeferUntilHostname => {
                 debug_assert!(false, "DeferUntilHostname leaked into TCP proxy task");
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
                 return Ok(());
             }
         }
@@ -151,8 +154,17 @@ async fn tcp_proxy_task(
         None
     };
 
-    let stream = TcpStream::connect(connect_dst).await?;
-    upstream_connected.store(true, Ordering::Release);
+    let stream = match TcpStream::connect(connect_dst).await {
+        Ok(stream) => {
+            proxy_connect.mark_connected();
+            stream
+        }
+        Err(e) => {
+            proxy_connect.mark_upstream_connect_failed();
+            shared.proxy_wake.wake();
+            return Err(e);
+        }
+    };
     let (mut server_rx, mut server_tx) = stream.into_split();
 
     // Replay the buffered first flight — run through secrets handler first.
@@ -770,7 +782,6 @@ mod tests {
     // ── plain-HTTP secret substitution ────────────────────────────────────────
 
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
@@ -826,7 +837,7 @@ mod tests {
         let shared = SharedState::new(4);
         let policy = Arc::new(NetworkPolicy::default());
         let secrets = Arc::new(secrets);
-        let upstream_connected = Arc::new(AtomicBool::new(false));
+        let proxy_connect = Arc::new(ProxyConnectState::new());
 
         from_tx.send(Bytes::from(request)).await.unwrap();
         drop(from_tx);
@@ -839,7 +850,7 @@ mod tests {
             Arc::new(shared),
             policy,
             secrets,
-            upstream_connected,
+            proxy_connect,
         )
         .await
         .unwrap();
@@ -856,7 +867,7 @@ mod tests {
 
         let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
         let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
-        let upstream_connected = Arc::new(AtomicBool::new(false));
+        let proxy_connect = Arc::new(ProxyConnectState::new());
 
         from_tx
             .send(Bytes::from_static(b"GET /api HTTP/1.1\r\n"))
@@ -878,7 +889,7 @@ mod tests {
             Arc::new(SharedState::new(4)),
             Arc::new(NetworkPolicy::default()),
             Arc::new(secrets),
-            upstream_connected,
+            proxy_connect,
         )
         .await
         .unwrap();
@@ -947,7 +958,7 @@ mod tests {
 
         let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
         let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
-        let upstream_connected = Arc::new(AtomicBool::new(false));
+        let proxy_connect = Arc::new(ProxyConnectState::new());
 
         from_tx
             .send(Bytes::from(header.into_bytes()))
@@ -967,7 +978,7 @@ mod tests {
             Arc::new(SharedState::new(4)),
             Arc::new(NetworkPolicy::default()),
             Arc::new(secrets),
-            upstream_connected,
+            proxy_connect,
         )
         .await
         .unwrap();
