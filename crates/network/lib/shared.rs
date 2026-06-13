@@ -16,6 +16,8 @@ use microsandbox_utils::ttl_reverse_index::TtlReverseIndex;
 pub use microsandbox_utils::wake_pipe::WakePipe;
 use parking_lot::RwLock;
 
+use crate::http_proxy::ProxyConfig;
+
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
@@ -77,6 +79,12 @@ pub struct SharedState {
 
     /// Aggregate network byte counters at the guest/runtime boundary.
     metrics: NetworkMetrics,
+
+    /// Host HTTP forward-proxy config, parsed from the environment once at
+    /// boot. When set, guest egress tunnels upstream connections through it
+    /// via HTTP `CONNECT` (see [`crate::http_proxy`]); unset means direct
+    /// connections, as before.
+    proxy: OnceLock<ProxyConfig>,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -120,6 +128,7 @@ impl SharedState {
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
             metrics: NetworkMetrics::default(),
+            proxy: OnceLock::new(),
         }
     }
 
@@ -142,6 +151,17 @@ impl SharedState {
     /// Gateway IPv6 address, if set.
     pub fn gateway_ipv6(&self) -> Option<Ipv6Addr> {
         self.gateway_ipv6.get().copied()
+    }
+
+    /// Install the host HTTP proxy config. Called once at boot, before the
+    /// poll thread spawns; later calls are ignored.
+    pub fn set_proxy(&self, proxy: ProxyConfig) {
+        let _ = self.proxy.set(proxy);
+    }
+
+    /// The host HTTP proxy config, if one was detected at boot.
+    pub fn proxy(&self) -> Option<&ProxyConfig> {
+        self.proxy.get()
     }
 
     /// Install a host-side termination hook.

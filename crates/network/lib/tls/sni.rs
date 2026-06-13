@@ -99,7 +99,16 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
         if name_type == 0x00 {
             // HostName.
             let name_bytes = list.get(pos..pos + name_len)?;
-            return String::from_utf8(name_bytes.to_vec()).ok();
+            let name = String::from_utf8(name_bytes.to_vec()).ok()?;
+            // A legal hostname has no control chars or whitespace. Reject them
+            // here so a malicious guest can't smuggle CR/LF (or other junk) out
+            // of the SNI and into anything that serializes it downstream (e.g.
+            // an upstream proxy CONNECT request line). Defensive — the proxy
+            // dialer also rejects these at the wire boundary.
+            if name.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+                return None;
+            }
+            return Some(name);
         }
 
         pos += name_len;
@@ -200,6 +209,16 @@ mod tests {
     fn extract_sni_from_client_hello() {
         let hello = build_client_hello("example.com");
         assert_eq!(extract_sni(&hello), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_sni_rejects_control_chars() {
+        // A guest could craft an SNI with embedded CRLF to inject headers into
+        // a downstream proxy CONNECT line — reject it at the source.
+        let hello = build_client_hello("evil.test\r\nProxy-Authorization: Basic x");
+        assert_eq!(extract_sni(&hello), None);
+        let with_space = build_client_hello("ev il.test");
+        assert_eq!(extract_sni(&with_space), None);
     }
 
     #[test]

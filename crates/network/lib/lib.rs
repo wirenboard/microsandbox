@@ -18,6 +18,7 @@ pub mod config;
 pub mod conn;
 pub mod device;
 pub mod dns;
+pub mod http_proxy;
 pub mod icmp_relay;
 pub mod intercept;
 pub mod network;
