@@ -426,6 +426,14 @@ async fn forward_plaintext(
             server_tls.write_all(&substituted).await?;
         }
     }
+    // Flush the upstream TLS stream so the request's final (often partial)
+    // record actually reaches the socket. `write_all` on tokio-rustls only
+    // guarantees the plaintext is buffered/encrypted — the tail can linger
+    // until the next write. But the relay then parks on `server_tls.read()`
+    // awaiting the response, so the server sees a request short of its
+    // Content-Length, waits out its request-read timeout, and RSTs with no
+    // response.
+    server_tls.flush().await?;
     Ok(false)
 }
 
