@@ -19,8 +19,10 @@ use crate::tree::{DirectoryNode, FileTree, TreeNode};
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Default image size: 4 GiB.
-const DEFAULT_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Default image size: 16 GiB. Writable-overlay headroom; the formatter
+/// sizes block groups dynamically up to `MAX_BLOCKS`, so no group-count
+/// cap needs to move in lockstep.
+const DEFAULT_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Default journal size in blocks (64 MiB at 4 KiB/block = 16384 blocks).
 const DEFAULT_JOURNAL_BLOCKS: u32 = 16384;
