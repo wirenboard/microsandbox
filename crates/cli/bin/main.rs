@@ -65,7 +65,13 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
 #[derive(Parser)]
 #[command(
     name = "msb",
-    version,
+    // Suffix marks this as a fork carrying agent-vm's patches (SecretValue::File
+    // + request-interceptor hook + auto-publish). agent-vm's `msb_install`
+    // REQUIRES the `+agent-vm` marker in `msb --version` and rejects a stock
+    // binary. Keeping the version-number prefix unchanged means the build
+    // script's GitHub-release URL derivation still resolves; only --version
+    // output and `Cli::version()` callers see the suffix.
+    version = concat!(env!("CARGO_PKG_VERSION"), "+agent-vm.phase4"),
     about = format!("Microsandbox CLI v{}", env!("CARGO_PKG_VERSION")),
     styles = microsandbox_cli::styles::styles()
 )]
