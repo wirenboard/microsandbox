@@ -198,6 +198,7 @@ pub fn smoltcp_poll_loop(
     dns_config: DnsConfig,
     tls_state: Option<Arc<TlsState>>,
     published_ports: Vec<PublishedPort>,
+    port_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<crate::publisher::PortCommand>,
     max_connections: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
     secrets: Arc<SecretsConfig>,
@@ -248,6 +249,7 @@ pub fn smoltcp_poll_loop(
         network_policy.clone(),
         shared.clone(),
         &tokio_handle,
+        port_cmd_rx,
     );
     let mut udp_relay = UdpRelay::new(
         shared.clone(),

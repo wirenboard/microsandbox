@@ -294,11 +294,37 @@ type NetworkMetricsHandle = microsandbox_network::network::MetricsHandle;
 #[cfg(not(feature = "net"))]
 type NetworkMetricsHandle = ();
 
+/// Bundle of handles needed to spawn the auto-publish task after the relay is
+/// ready: the port-command sender (drives `PortPublisher` add/remove), the
+/// auto-publish config, and the guest VLAN IPs agentd binds its loopback
+/// forwarder on. Captured during `build_vm` so the caller can wire them up
+/// once the agent socket exists.
+///
+/// Defined as a unit-like type when the `net` feature is off so it can sit in
+/// `build_vm`'s return tuple without per-field `cfg` tricks.
+#[cfg(feature = "net")]
+pub(crate) struct AutoPublishHandles {
+    pub(crate) port_handle:
+        tokio::sync::mpsc::UnboundedSender<microsandbox_network::publisher::PortCommand>,
+    pub(crate) cfg: microsandbox_network::config::AutoPublishConfig,
+    /// Guest's VLAN IPv4 address, passed to agentd in `LoopbackForwardReq` so
+    /// it knows what address to bind the in-guest forwarder on for
+    /// `127.0.0.1`-only services. `None` when the sandbox runs v6-only.
+    pub(crate) guest_ipv4: Option<std::net::Ipv4Addr>,
+    /// Guest's VLAN IPv6 address, for `[::1]`-only services. `None` when the
+    /// sandbox runs v4-only.
+    pub(crate) guest_ipv6: Option<std::net::Ipv6Addr>,
+}
+
+#[cfg(not(feature = "net"))]
+pub(crate) struct AutoPublishHandles;
+
 type VmBuildOutput = (
     msb_krun::Vm,
     Option<NetworkTerminationHandle>,
     Option<NetworkMetricsHandle>,
     BindIdentityMapRegistration,
+    Option<AutoPublishHandles>,
 );
 
 //--------------------------------------------------------------------------------------------------
@@ -534,8 +560,13 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         },
         tokio_rt.handle().clone(),
     );
-    let (vm, _network_termination_handle, network_metrics_handle, bind_identity_map) =
-        match build_result {
+    let (
+        vm,
+        _network_termination_handle,
+        network_metrics_handle,
+        bind_identity_map,
+        auto_publish_handles,
+    ) = match build_result {
             Ok(vm) => vm,
             Err(e) => {
                 let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
@@ -628,6 +659,12 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let (_relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::watch::channel(false);
     let (relay_drain_tx, mut relay_drain_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+    // Grab the broadcast handle off the relay BEFORE it is moved into the
+    // wait_ready/run task — `broadcast_handle()` keeps an Arc to the clients
+    // map, so the handle stays valid for the relay's whole lifetime.
+    #[cfg(feature = "net")]
+    let relay_broadcast = relay.broadcast_handle();
+
     // Relay: spawn a blocking task for wait_ready, then run the accept loop.
     // wait_ready() must run AFTER enter() starts the VM (agentd sends core.ready),
     // so it runs on a background thread, not blocking the main thread.
@@ -668,6 +705,39 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             Err(e) => tracing::error!("agent relay wait_ready task panicked: {e}"),
         }
     });
+
+    // Auto-publish: spawn the poll loop now that the relay is running. The loop
+    // opens a loopback UDS to agent.sock, so it's safe to spawn even before
+    // wait_ready completes — its initial connect-with-retry handles the race.
+    #[cfg(feature = "net")]
+    if let Some(handles) = auto_publish_handles {
+        struct RelayBroadcastAdapter(crate::relay::RelayBroadcast);
+        impl crate::auto_publish::EventBroadcast for RelayBroadcastAdapter {
+            fn broadcast_port_event(&self, event: microsandbox_protocol::network::PortEvent) {
+                let id = microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID;
+                let msg = match microsandbox_protocol::message::Message::with_payload(
+                    microsandbox_protocol::message::MessageType::PortEvent,
+                    id,
+                    &event,
+                ) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+                self.0.broadcast(&msg);
+            }
+        }
+        let adapter: std::sync::Arc<dyn crate::auto_publish::EventBroadcast> =
+            std::sync::Arc::new(RelayBroadcastAdapter(relay_broadcast.clone()));
+        crate::auto_publish::spawn(
+            tokio_rt.handle(),
+            config.agent_sock_path.clone(),
+            handles.cfg,
+            handles.port_handle,
+            handles.guest_ipv4,
+            handles.guest_ipv6,
+            adapter,
+        );
+    }
 
     // Shutdown listener: when the relay forwards a `core.shutdown` frame to
     // agentd, we give the guest a window to flush block-backed roots and
@@ -1016,6 +1086,8 @@ fn build_vm(
 
     let mut network_termination_handle = None;
     let mut network_metrics_handle = None;
+    #[cfg(feature = "net")]
+    let mut auto_publish_handles: Option<AutoPublishHandles> = None;
 
     // Network.
     #[cfg(feature = "net")]
@@ -1030,6 +1102,18 @@ fn build_vm(
             microsandbox_network::network::SmoltcpNetwork::new(vm.network.clone(), vm.sandbox_slot);
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());
+
+        // Capture handles for auto-publish before `network` is moved into the
+        // rest of the builder steps. Holding a port_handle clone keeps the
+        // channel into the smoltcp poll thread open.
+        if let Some(ap_cfg) = vm.network.auto_publish.clone() {
+            auto_publish_handles = Some(AutoPublishHandles {
+                port_handle: network.port_handle(),
+                cfg: ap_cfg,
+                guest_ipv4: network.guest_ipv4(),
+                guest_ipv6: network.guest_ipv6(),
+            });
+        }
 
         network.start(tokio_handle.clone());
 
@@ -1093,11 +1177,14 @@ fn build_vm(
         .build()
         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
 
+    #[cfg(not(feature = "net"))]
+    let auto_publish_handles: Option<AutoPublishHandles> = None;
     Ok((
         vm,
         network_termination_handle,
         network_metrics_handle,
         bind_identity_map,
+        auto_publish_handles,
     ))
 }
 

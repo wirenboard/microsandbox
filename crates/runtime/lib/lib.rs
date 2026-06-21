@@ -11,6 +11,7 @@ mod error;
 // Exports
 //--------------------------------------------------------------------------------------------------
 
+pub mod auto_publish;
 pub mod boot_error;
 pub mod console;
 pub mod exec_log;

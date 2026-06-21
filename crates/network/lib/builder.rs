@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
 
-use crate::config::{DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort};
+use crate::config::{
+    AutoPublishConfig, DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort,
+};
 use crate::dns::Nameserver;
 use crate::intercept::config::{InterceptConfig, InterceptRule};
 use crate::policy::{BuildError, Destination, DestinationGroup, NetworkPolicy, Rule};
@@ -308,6 +310,22 @@ impl NetworkBuilder {
     /// unknown to the guest's stock Mozilla bundle.
     pub fn trust_host_cas(mut self, enabled: bool) -> Self {
         self.config.trust_host_cas = enabled;
+        self
+    }
+
+    /// Enable auto-publish: the runtime polls the guest's
+    /// `/proc/net/tcp{,6}` and mirrors each new LISTEN socket onto a host
+    /// listener (Lima-style). Uses the default poll interval (2s) and host
+    /// bind (`127.0.0.1`). For non-default values use
+    /// [`Self::auto_publish_with`].
+    pub fn auto_publish(mut self) -> Self {
+        self.config.auto_publish = Some(AutoPublishConfig::default());
+        self
+    }
+
+    /// Enable auto-publish with explicit config (poll interval, host bind).
+    pub fn auto_publish_with(mut self, cfg: AutoPublishConfig) -> Self {
+        self.config.auto_publish = Some(cfg);
         self
     }
 

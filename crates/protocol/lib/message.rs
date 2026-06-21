@@ -206,6 +206,34 @@ pub enum MessageType {
     /// Guest reports that a TCP session failed. Terminal.
     #[strum(serialize = "core.tcp.failed")]
     TcpFailed,
+
+    /// Host-side broadcast: a published-port mapping was added or
+    /// removed. Emitted by the runtime relay on the reserved
+    /// correlation ID [`crate::network::PORT_EVENT_BROADCAST_ID`].
+    /// Payload: [`crate::network::PortEvent`].
+    #[strum(serialize = "host.port.event")]
+    PortEvent,
+
+    /// Host → agentd: request an in-guest loopback forwarder
+    /// (`bind_addr:port` → `127.0.0.1:port`). Payload:
+    /// [`crate::network::LoopbackForwardReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`] on the same
+    /// correlation ID.
+    #[strum(serialize = "guest.loopback.forward")]
+    LoopbackForward,
+
+    /// Host → agentd: cancel a forwarder previously installed via
+    /// [`Self::LoopbackForward`]. Payload:
+    /// [`crate::network::LoopbackForwardCancelReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`].
+    #[strum(serialize = "guest.loopback.forward.cancel")]
+    LoopbackForwardCancel,
+
+    /// agentd → host: ack for a LoopbackForward /
+    /// LoopbackForwardCancel. Terminal. Payload:
+    /// [`crate::network::LoopbackForwardResp`].
+    #[strum(serialize = "guest.loopback.forward.resp")]
+    LoopbackForwardResp,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -251,6 +279,14 @@ impl Message {
 
 impl MessageType {
     /// Computes the frame flags byte for this message type.
+    ///
+    /// `LoopbackForward` and `LoopbackForwardCancel` are intentionally
+    /// NOT marked `FLAG_SESSION_START` — they're one-shot RPCs,
+    /// not streaming sessions, so the relay shouldn't register
+    /// their correlation IDs into `client.active_sessions`. The
+    /// matching `LoopbackForwardResp` still carries `FLAG_TERMINAL`
+    /// so the SDK client's pending-map subscription is removed
+    /// after the reply is delivered.
     pub fn flags(&self) -> u8 {
         match self {
             Self::CoreError
@@ -258,7 +294,8 @@ impl MessageType {
             | Self::ExecFailed
             | Self::FsResponse
             | Self::TcpClosed
-            | Self::TcpFailed => FLAG_TERMINAL,
+            | Self::TcpFailed
+            | Self::LoopbackForwardResp => FLAG_TERMINAL,
             Self::ExecRequest | Self::FsRequest | Self::TcpConnect => FLAG_SESSION_START,
             Self::Shutdown => FLAG_SHUTDOWN,
             _ => 0,
@@ -311,6 +348,14 @@ impl MessageType {
             | Self::TcpClose
             | Self::TcpClosed
             | Self::TcpFailed => 4,
+            // Auto-publish port mirroring + in-guest loopback forwarding.
+            // Introduced in the current generation; gated at the live
+            // `PROTOCOL_VERSION` so a peer that predates them is never sent
+            // one.
+            Self::PortEvent
+            | Self::LoopbackForward
+            | Self::LoopbackForwardCancel
+            | Self::LoopbackForwardResp => PROTOCOL_VERSION,
         }
     }
 
@@ -406,6 +451,16 @@ mod tests {
             (MessageType::TcpClose, "core.tcp.close"),
             (MessageType::TcpClosed, "core.tcp.closed"),
             (MessageType::TcpFailed, "core.tcp.failed"),
+            (MessageType::PortEvent, "host.port.event"),
+            (MessageType::LoopbackForward, "guest.loopback.forward"),
+            (
+                MessageType::LoopbackForwardCancel,
+                "guest.loopback.forward.cancel",
+            ),
+            (
+                MessageType::LoopbackForwardResp,
+                "guest.loopback.forward.resp",
+            ),
         ];
 
         for (mt, expected_str) in &types {
@@ -444,6 +499,10 @@ mod tests {
             MessageType::TcpClose,
             MessageType::TcpClosed,
             MessageType::TcpFailed,
+            MessageType::PortEvent,
+            MessageType::LoopbackForward,
+            MessageType::LoopbackForwardCancel,
+            MessageType::LoopbackForwardResp,
         ];
 
         for mt in &types {
@@ -500,6 +559,14 @@ mod tests {
         assert_eq!(MessageType::TcpData.flags(), 0);
         assert_eq!(MessageType::TcpEof.flags(), 0);
         assert_eq!(MessageType::TcpClose.flags(), 0);
+        assert_eq!(MessageType::PortEvent.flags(), 0);
+        // Loopback RPCs are one-shot, not sessions — the relay must
+        // not register their correlation IDs into active_sessions.
+        assert_eq!(MessageType::LoopbackForward.flags(), 0);
+        assert_eq!(MessageType::LoopbackForwardCancel.flags(), 0);
+        // The reply is still terminal so the SDK client drops the
+        // pending-map subscription.
+        assert_eq!(MessageType::LoopbackForwardResp.flags(), FLAG_TERMINAL);
     }
 
     #[test]

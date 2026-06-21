@@ -11,6 +11,7 @@
     clippy::manual_c_str_literals
 )]
 
+pub mod auto_publish;
 pub mod backend;
 pub mod builder;
 pub mod config;

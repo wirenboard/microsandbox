@@ -75,6 +75,46 @@ pub struct NetworkConfig {
     /// this is explicitly enabled. Default: false.
     #[serde(default)]
     pub trust_host_cas: bool,
+
+    /// Auto-detect TCP LISTEN sockets inside the guest and mirror
+    /// each on `127.0.0.1:<same port>` on the host (Lima-style). The
+    /// runtime spawns a poll task on top of the smoltcp stack that
+    /// reads `/proc/net/tcp{,6}` over the agent.sock channel every
+    /// few seconds, diff-drives the [`crate::publisher::PortPublisher`]
+    /// via [`PortCommand`](crate::publisher::PortCommand), and emits
+    /// `MessageType::PortEvent` frames for SDK clients to observe.
+    /// Default: `None` (disabled).
+    #[serde(default)]
+    pub auto_publish: Option<AutoPublishConfig>,
+}
+
+/// Configuration for the runtime auto-publish loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPublishConfig {
+    /// Poll interval in milliseconds. Default 2000 (matches Lima).
+    #[serde(default = "default_auto_publish_poll_ms")]
+    pub poll_interval_ms: u64,
+
+    /// Host bind address for mirrored listeners. Default `127.0.0.1`.
+    #[serde(default = "default_auto_publish_host_bind")]
+    pub host_bind: IpAddr,
+}
+
+impl Default for AutoPublishConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: default_auto_publish_poll_ms(),
+            host_bind: default_auto_publish_host_bind(),
+        }
+    }
+}
+
+fn default_auto_publish_poll_ms() -> u64 {
+    2000
+}
+
+fn default_auto_publish_host_bind() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
 /// Optional overrides for the guest interface.
@@ -176,6 +216,7 @@ impl Default for NetworkConfig {
             intercept: InterceptConfig::default(),
             max_connections: None,
             trust_host_cas: false,
+            auto_publish: None,
         }
     }
 }
