@@ -13,6 +13,7 @@ use tokio_rustls::TlsConnector;
 use super::ca::CertAuthority;
 use super::certgen::{self, DomainCert, DomainCertError};
 use super::config::TlsConfig;
+use crate::intercept::config::InterceptConfig;
 use crate::secrets::config::SecretsConfig;
 
 //--------------------------------------------------------------------------------------------------
@@ -34,6 +35,8 @@ pub struct TlsState {
     pub config: TlsConfig,
     /// Secrets configuration for placeholder substitution.
     pub secrets: SecretsConfig,
+    /// Interceptor configuration (e.g. OAuth refresh MITM).
+    pub intercept: InterceptConfig,
     /// Pre-computed lowercased bypass patterns for efficient matching.
     bypass_patterns: Vec<BypassPattern>,
 }
@@ -67,14 +70,14 @@ impl TlsState {
     /// 1. User-provided paths (`config.intercept_ca.cert_path` + `config.intercept_ca.key_path`)
     /// 2. Default persistence path (`~/.microsandbox/tls/ca.{crt,key}`)
     /// 3. Auto-generate and persist to default path
-    pub fn new(config: TlsConfig, secrets: SecretsConfig) -> Self {
+    pub fn new(config: TlsConfig, secrets: SecretsConfig, intercept: InterceptConfig) -> Self {
         let ca = load_or_generate_ca(&config);
 
         let capacity =
             NonZeroUsize::new(config.cache.capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
         let cert_cache = Mutex::new(LruCache::new(capacity));
 
-        let connector = build_upstream_connector(&config);
+        let connector = build_upstream_connector(&config, intercept.is_active());
 
         // Pre-compute lowercased bypass patterns to avoid per-connection allocations.
         let bypass_patterns = config
@@ -100,6 +103,7 @@ impl TlsState {
             connector,
             config,
             secrets,
+            intercept,
             bypass_patterns,
         }
     }
@@ -153,7 +157,7 @@ mod tests {
     #[test]
     fn regenerates_cached_domain_cert_when_near_expiry() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let state = TlsState::new(TlsConfig::default(), SecretsConfig::default());
+        let state = TlsState::new(TlsConfig::default(), SecretsConfig::default(), InterceptConfig::default());
         let first = state.get_or_generate_cert("openrouter.ai").unwrap();
         let original_expires_at = first.expires_at;
 
@@ -176,7 +180,7 @@ mod tests {
     #[test]
     fn invalid_domain_cert_request_does_not_poison_cache() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let state = TlsState::new(TlsConfig::default(), SecretsConfig::default());
+        let state = TlsState::new(TlsConfig::default(), SecretsConfig::default(), InterceptConfig::default());
 
         assert!(state.get_or_generate_cert("snowman.☃").is_err());
         assert!(state.get_or_generate_cert("openrouter.ai").is_ok());
@@ -238,7 +242,7 @@ impl ServerCertVerifier for NoVerify {
 ///
 /// When `verify_upstream` is true, loads the system's native root certificates.
 /// When false, uses a permissive verifier that accepts all server certificates.
-fn build_upstream_connector(config: &TlsConfig) -> TlsConnector {
+fn build_upstream_connector(config: &TlsConfig, intercept_active: bool) -> TlsConnector {
     let client_config = if config.verify_upstream {
         let mut root_store = rustls::RootCertStore::empty();
         let certs = rustls_native_certs::load_native_certs();
@@ -293,6 +297,17 @@ fn build_upstream_connector(config: &TlsConfig) -> TlsConnector {
             .with_custom_certificate_verifier(Arc::new(NoVerify))
             .with_no_client_auth()
     };
+
+    // The interceptor's request parser is HTTP/1.1-aware only (it splits on
+    // `\r\n`). When interception is active, advertise only http/1.1 in the
+    // upstream ALPN so a server that would otherwise pin h2 (e.g.
+    // chatgpt.com) can't switch us to a framing the hook can't parse. When
+    // interception is off we leave ALPN at the rustls default so upstream's
+    // HTTP/2-capable secret substitution keeps working.
+    let mut client_config = client_config;
+    if intercept_active {
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
 
     TlsConnector::from(Arc::new(client_config))
 }

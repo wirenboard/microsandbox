@@ -9,6 +9,7 @@ use ipnetwork::{Ipv4Network, Ipv6Network};
 
 use crate::config::{DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort};
 use crate::dns::Nameserver;
+use crate::intercept::config::{InterceptConfig, InterceptRule};
 use crate::policy::{BuildError, Destination, DestinationGroup, NetworkPolicy, Rule};
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretValue, ViolationAction,
@@ -236,6 +237,27 @@ impl NetworkBuilder {
         f: impl FnOnce(ViolationActionBuilder) -> ViolationActionBuilder,
     ) -> Self {
         self.config.secrets.on_violation = f(ViolationActionBuilder::default()).build();
+        self
+    }
+
+    /// Configure the request-interceptor hook.
+    ///
+    /// `hook` is the subprocess command (argv vector) invoked when a
+    /// matched intercepted request is fully buffered. The hook receives the
+    /// request bytes on stdin and is expected to write a complete HTTP
+    /// response on stdout.
+    ///
+    /// Each `rule(host, method, path_prefix)` call adds one route to the
+    /// match set. Rules are AND-matched (host + method + path_prefix all
+    /// must hold) and the first matching rule fires.
+    ///
+    /// ```ignore
+    /// .intercept(|i| i
+    ///     .hook(["/usr/local/bin/my-hook"])
+    ///     .rule("auth.example.com", "POST", "/oauth/token"))
+    /// ```
+    pub fn intercept(mut self, f: impl FnOnce(InterceptBuilder) -> InterceptBuilder) -> Self {
+        self.config.intercept = f(InterceptBuilder::default()).build();
         self
     }
 
@@ -545,6 +567,77 @@ impl SecretBuilder {
             on_violation: self.on_violation,
             require_tls_identity: self.require_tls_identity,
         }
+    }
+}
+
+/// Fluent builder for [`InterceptConfig`].
+#[derive(Default)]
+pub struct InterceptBuilder {
+    config: InterceptConfig,
+}
+
+impl InterceptBuilder {
+    /// Set the hook command (argv vector). Required for the interceptor to
+    /// fire — without it the config stays inert.
+    pub fn hook<I, S>(mut self, hook: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.hook = Some(hook.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Add one match rule. Multiple calls accumulate. The hook is invoked
+    /// once the *full request body* has been buffered (or the per-request
+    /// cap is hit).
+    pub fn rule(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            dispatch_on_headers: false,
+        });
+        self
+    }
+
+    /// Add a match rule that fires the hook as soon as the request
+    /// **headers** are seen — does NOT wait for the body. Use for
+    /// path-based allow/deny decisions where the body is irrelevant (or too
+    /// large to buffer, e.g. git push pack data).
+    ///
+    /// The hook signals via stdout: empty = passthrough (proxy continues
+    /// streaming, network-secret substitution still applies); non-empty =
+    /// synthesized response (same as `rule()`).
+    pub fn rule_streaming(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            dispatch_on_headers: true,
+        });
+        self
+    }
+
+    /// Override the per-request buffer ceiling (default 64 KiB).
+    pub fn max_request_bytes(mut self, n: usize) -> Self {
+        self.config.max_request_bytes = n;
+        self
+    }
+
+    /// Consume and return the configured [`InterceptConfig`].
+    pub fn build(self) -> InterceptConfig {
+        self.config
     }
 }
 

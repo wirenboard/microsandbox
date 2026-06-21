@@ -147,6 +147,7 @@ impl SmoltcpNetwork {
             Some(Arc::new(TlsState::new(
                 config.tls.clone(),
                 config.secrets.clone(),
+                config.intercept.clone(),
             )))
         } else {
             None

@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use super::sni;
 use super::state::TlsState;
 use crate::conn::ProxyConnectState;
+use crate::intercept::handler::{Interceptor, Verdict};
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::connect_upstream;
 use crate::secrets::config::ViolationAction;
@@ -245,6 +246,16 @@ pub(crate) async fn intercept_relay(
         SecretsHandler::new_tls_intercepted(&tls_state.secrets, sni_name, guest_dst.ip(), &shared)
             .with_guest_dst(guest_dst);
 
+    // Per-connection request interceptor (e.g. OAuth-refresh MITM, repo
+    // allow-listing). Streams chunks through unchanged when no rule
+    // matches; otherwise buffers a request and hands it to the hook
+    // subprocess. The interceptor sees post-substitution bytes.
+    let mut interceptor = if tls_state.intercept.is_active() {
+        Some(Interceptor::new(tls_state.intercept.clone(), sni_name))
+    } else {
+        None
+    };
+
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
         .get_or_generate_cert(sni_name)
@@ -313,14 +324,21 @@ pub(crate) async fn intercept_relay(
     // In TLS 1.3, the client sends Finished + application data in the same
     // flight, so process_new_packets() during the handshake loop may have
     // already decrypted the first HTTP request into the plaintext buffer.
-    forward_plaintext(
+    if forward_plaintext(
         &mut guest_tls,
         &mut server_tls,
         &mut secrets_handler,
+        interceptor.as_mut(),
         &shared,
         &mut plaintext_buf,
+        &to_smoltcp,
+        &mut tls_buf,
     )
-    .await?;
+    .await?
+    {
+        // Interceptor synthesized a response to the guest; connection is done.
+        return Ok(());
+    }
 
     loop {
         tokio::select! {
@@ -339,14 +357,20 @@ pub(crate) async fn intercept_relay(
                     guest_tls
                         .process_new_packets()
                         .map_err(io::Error::other)?;
-                    forward_plaintext(
+                    if forward_plaintext(
                         &mut guest_tls,
                         &mut server_tls,
                         &mut secrets_handler,
+                        interceptor.as_mut(),
                         &shared,
                         &mut plaintext_buf,
+                        &to_smoltcp,
+                        &mut tls_buf,
                     )
-                    .await?;
+                    .await?
+                    {
+                        return Ok(());
+                    }
                 }
             }
 
@@ -411,14 +435,22 @@ pub(crate) async fn extract_sni_from_channel(
 
 /// Read all available decrypted plaintext from the guest-facing TLS
 /// connection and forward it to the upstream server, applying secret
-/// substitution when configured.
+/// substitution and optional request interception when configured.
+///
+/// Returns `Ok(true)` if the interceptor handled a full request and wrote a
+/// synthesized response back to the guest — the caller should stop the
+/// connection. `Ok(false)` means streaming continues as normal.
+#[allow(clippy::too_many_arguments)]
 async fn forward_plaintext(
     guest_tls: &mut rustls::ServerConnection,
     server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
     secrets_handler: &mut SecretsHandler,
+    mut interceptor: Option<&mut Interceptor>,
     shared: &SharedState,
     buf: &mut [u8],
-) -> io::Result<()> {
+    to_smoltcp: &mpsc::Sender<Bytes>,
+    tls_buf: &mut Vec<u8>,
+) -> io::Result<bool> {
     let mut wrote_plaintext = false;
 
     loop {
@@ -429,29 +461,70 @@ async fn forward_plaintext(
             Err(e) => return Err(e),
         };
 
-        if secrets_handler.is_empty() {
-            server_tls.write_all(&buf[..n]).await?;
-            wrote_plaintext = true;
+        // Substitution first: the interceptor sees post-substitution bytes
+        // (the same request the upstream server would receive). Stay
+        // zero-copy on the no-secrets path via `Cow::Borrowed`.
+        let substituted: std::borrow::Cow<'_, [u8]> = if secrets_handler.is_empty() {
+            std::borrow::Cow::Borrowed(&buf[..n])
+        } else {
+            match secrets_handler.substitute(&buf[..n]) {
+                Ok(data) => data,
+                Err(action) => {
+                    // Violation: placeholder going to disallowed host. Drop it.
+                    if matches!(action, ViolationAction::BlockAndTerminate) {
+                        shared.trigger_termination();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "secret violation: placeholder sent to disallowed host",
+                    ));
+                }
+            }
+        };
+
+        // An empty result means the secrets handler is still buffering this
+        // request (e.g. accumulating a header block it will emit on a later
+        // chunk). There is nothing to forward yet AND nothing for the
+        // interceptor to parse — feeding it an empty chunk would make
+        // `process_first_chunk` find no request line and latch to `Forwarding`,
+        // silently bypassing the hook for the whole connection. Skip until the
+        // handler emits the real (substituted) bytes.
+        if substituted.is_empty() {
             continue;
         }
 
-        match secrets_handler.substitute(&buf[..n]) {
-            Ok(data) => {
-                if !data.is_empty() {
-                    server_tls.write_all(&data).await?;
+        match interceptor.as_deref_mut() {
+            None => {
+                server_tls.write_all(&substituted).await?;
+                wrote_plaintext = true;
+            }
+            Some(intercept) => match intercept.process_chunk(&substituted).await? {
+                Verdict::Forward => {
+                    server_tls.write_all(&substituted).await?;
                     wrote_plaintext = true;
                 }
-            }
-            Err(action) => {
-                // Violation: placeholder going to disallowed host. Drop the connection.
-                if matches!(action, ViolationAction::BlockAndTerminate) {
-                    shared.trigger_termination();
+                Verdict::ForwardBuffered(buffered) => {
+                    if !buffered.is_empty() {
+                        server_tls.write_all(&buffered).await?;
+                        wrote_plaintext = true;
+                    }
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "secret violation: placeholder sent to disallowed host",
-                ));
-            }
+                Verdict::Hold => continue,
+                Verdict::Intercept(response) => {
+                    // Hook synthesized the whole response. Flush any pending
+                    // upstream writes, hand the response to the guest, and
+                    // signal the caller to close the connection.
+                    if wrote_plaintext {
+                        server_tls.flush().await?;
+                    }
+                    guest_tls
+                        .writer()
+                        .write_all(&response)
+                        .map_err(io::Error::other)?;
+                    flush_to_guest(guest_tls, to_smoltcp, shared, tls_buf).await?;
+                    return Ok(true);
+                }
+            },
         }
     }
 
@@ -461,7 +534,7 @@ async fn forward_plaintext(
         server_tls.flush().await?;
     }
 
-    Ok(())
+    Ok(false)
 }
 
 /// Flush pending TLS output from the guest-facing rustls connection

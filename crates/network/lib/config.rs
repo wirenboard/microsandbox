@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
 
+use crate::intercept::config::InterceptConfig;
 use crate::policy::NetworkPolicy;
 use crate::secrets::config::SecretsConfig;
 use crate::tls::TlsConfig;
@@ -53,6 +54,14 @@ pub struct NetworkConfig {
     /// Secret injection settings.
     #[serde(default)]
     pub secrets: SecretsConfig,
+
+    /// Request-interceptor hook. Buffers a matched request and hands it to
+    /// a hook subprocess that returns a synthesized response — used e.g. to
+    /// MITM an in-VM agent's OAuth refresh-token endpoint so the host can
+    /// trigger a real refresh. See
+    /// [`InterceptConfig`](crate::intercept::config::InterceptConfig).
+    #[serde(default)]
+    pub intercept: InterceptConfig,
 
     /// Max concurrent guest connections. Default: 256.
     #[serde(default)]
@@ -164,6 +173,7 @@ impl Default for NetworkConfig {
             dns: DnsConfig::default(),
             tls: TlsConfig::default(),
             secrets: SecretsConfig::default(),
+            intercept: InterceptConfig::default(),
             max_connections: None,
             trust_host_cas: false,
         }
