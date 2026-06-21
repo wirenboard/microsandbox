@@ -1,6 +1,8 @@
 //! Secret injection configuration types.
 
-use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -25,6 +27,108 @@ pub struct SecretsConfig {
     pub on_violation: ViolationAction,
 }
 
+/// Source for a secret's real value. The value never enters the sandbox.
+///
+/// `Static` captures the bytes at builder time; `File` re-reads the host
+/// file at *connection-setup* time, allowing the value to change over the
+/// lifetime of the running sandbox (e.g. a host-side credential file
+/// rotated by another process). The connection-scoped resolution means a
+/// single in-flight request always sees a consistent value even if the
+/// file changes mid-stream.
+///
+/// ## Wire format
+///
+/// The on-the-wire form is a single string so the serialized
+/// [`SecretEntry`] stays backward-compatible with a `msb` daemon built
+/// before this enum existed:
+///
+/// - `Static(v)` ↔ `v`                  (bare string)
+/// - `File(p)`   ↔ `"\0msbfile:<path>"`  (NUL-prefixed sentinel)
+///
+/// API tokens are always printable ASCII, so the NUL prefix can't collide
+/// with a legitimate static value. Old daemons that don't recognise the
+/// sentinel treat the whole string (including the NUL) as a static value —
+/// broken for `File`, but never crashes.
+#[derive(Clone)]
+pub enum SecretValue {
+    /// Literal value captured at builder time.
+    Static(String),
+    /// Path to a host file whose contents (trailing whitespace trimmed)
+    /// are read on each new connection that matches this secret. Reads
+    /// happen on the host's filesystem and never enter the sandbox.
+    File(PathBuf),
+}
+
+const FILE_SENTINEL_PREFIX: &str = "\0msbfile:";
+
+impl SecretValue {
+    /// Resolve to the current secret bytes. For `Static` returns the
+    /// captured string verbatim; for `File` reads from disk and trims
+    /// trailing ASCII whitespace (a `\n` from editors is the common case).
+    pub fn resolve(&self) -> std::io::Result<String> {
+        match self {
+            SecretValue::Static(s) => Ok(s.clone()),
+            SecretValue::File(p) => {
+                let mut s = std::fs::read_to_string(p)?;
+                while matches!(s.as_bytes().last(), Some(b) if b.is_ascii_whitespace()) {
+                    s.pop();
+                }
+                Ok(s)
+            }
+        }
+    }
+}
+
+impl From<String> for SecretValue {
+    fn from(s: String) -> Self {
+        SecretValue::Static(s)
+    }
+}
+
+impl From<&str> for SecretValue {
+    fn from(s: &str) -> Self {
+        SecretValue::Static(s.to_string())
+    }
+}
+
+impl From<PathBuf> for SecretValue {
+    fn from(p: PathBuf) -> Self {
+        SecretValue::File(p)
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretValue::Static(_) => f.write_str("SecretValue::Static([REDACTED])"),
+            SecretValue::File(p) => write!(f, "SecretValue::File({})", p.display()),
+        }
+    }
+}
+
+impl Serialize for SecretValue {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SecretValue::Static(v) => ser.serialize_str(v),
+            SecretValue::File(p) => {
+                let encoded = format!("{FILE_SENTINEL_PREFIX}{}", p.display());
+                ser.serialize_str(&encoded)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretValue {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        if let Some(rest) = s.strip_prefix(FILE_SENTINEL_PREFIX) {
+            Ok(SecretValue::File(PathBuf::from(rest)))
+        } else {
+            Ok(SecretValue::Static(s))
+        }
+    }
+}
+
 /// A single secret entry (serializable form passed to the network engine).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SecretEntry {
@@ -36,7 +140,11 @@ pub struct SecretEntry {
     pub env_var: String,
 
     /// The actual secret value (never enters the sandbox).
-    pub value: String,
+    ///
+    /// `Static` for inline values; `File` re-reads a host file on each
+    /// matching connection so a rotated credential is picked up without
+    /// restarting the sandbox.
+    pub value: SecretValue,
 
     /// Placeholder string the sandbox sees instead of the real value.
     ///

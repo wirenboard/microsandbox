@@ -10,7 +10,9 @@ use ipnetwork::{Ipv4Network, Ipv6Network};
 use crate::config::{DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort};
 use crate::dns::Nameserver;
 use crate::policy::{BuildError, NetworkPolicy};
-use crate::secrets::config::{HostPattern, SecretEntry, SecretInjection, ViolationAction};
+use crate::secrets::config::{
+    HostPattern, SecretEntry, SecretInjection, SecretValue, ViolationAction,
+};
 use crate::tls::TlsConfig;
 
 //--------------------------------------------------------------------------------------------------
@@ -45,7 +47,7 @@ pub struct TlsBuilder {
 /// ```
 pub struct SecretBuilder {
     env_var: Option<String>,
-    value: Option<String>,
+    value: Option<SecretValue>,
     placeholder: Option<String>,
     allowed_hosts: Vec<HostPattern>,
     injection: SecretInjection,
@@ -178,7 +180,7 @@ impl NetworkBuilder {
     pub fn secret_env(
         mut self,
         env_var: impl Into<String>,
-        value: impl Into<String>,
+        value: impl Into<SecretValue>,
         placeholder: impl Into<String>,
         allowed_host: impl Into<String>,
     ) -> Self {
@@ -400,7 +402,11 @@ impl SecretBuilder {
     }
 
     /// Set the secret value (required).
-    pub fn value(mut self, value: impl Into<String>) -> Self {
+    ///
+    /// Accepts a `String`/`&str` (captured inline as a static value) or a
+    /// `PathBuf` (read from the host file on each matching connection, so a
+    /// rotated credential is picked up without restarting the sandbox).
+    pub fn value(mut self, value: impl Into<SecretValue>) -> Self {
         self.value = Some(value.into());
         self
     }

@@ -564,13 +564,31 @@ impl SecretsHandler {
             // If the SNI matches an allowed host for this secret, add it to the
             // eligible list for substitution, and skip violation checks for this secret.
             if host_allowed {
+                // Resolve the secret value at connection-setup time. For
+                // `File`-backed secrets this re-reads the host file, so a
+                // rotated credential is picked up without restarting the
+                // sandbox. If the read fails we skip substitution for this
+                // connection (the placeholder is forwarded unchanged to the
+                // already-allowed host) rather than substituting an empty
+                // string — degraded but never corrupting.
+                let resolved_value = match secret.value.resolve() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            env_var = %secret.env_var,
+                            error = %e,
+                            "secret value resolve failed; skipping substitution on this connection"
+                        );
+                        continue;
+                    }
+                };
                 if secret.injection.body {
                     max_body_placeholder_len = max_body_placeholder_len
                         .max(secret.placeholder.len().min(MAX_SECRET_PLACEHOLDER_BYTES));
                 }
                 eligible_for_substitution.push(EligibleSecret {
                     placeholder: secret.placeholder.clone(),
-                    value: secret.value.clone(),
+                    value: resolved_value,
                     inject_headers: secret.injection.headers,
                     inject_basic_auth: secret.injection.basic_auth,
                     inject_query_params: secret.injection.query_params,

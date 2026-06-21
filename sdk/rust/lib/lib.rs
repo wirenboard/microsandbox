@@ -40,6 +40,8 @@ pub use config::set_sdk_libkrunfw_path as set_libkrunfw_path;
 pub use error::*;
 pub use image::{Image, ImageConfigDetail, ImageDetail, ImageHandle, ImageLayerDetail};
 pub use microsandbox_image::RegistryAuth;
+#[cfg(feature = "net")]
+pub use microsandbox_network::secrets::config::SecretValue;
 pub use microsandbox_protocol as protocol;
 pub use microsandbox_runtime::logging::LogLevel;
 pub use microsandbox_utils::size;
