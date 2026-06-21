@@ -9,7 +9,7 @@ use ipnetwork::{Ipv4Network, Ipv6Network};
 
 use crate::config::{DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort};
 use crate::dns::Nameserver;
-use crate::policy::{BuildError, NetworkPolicy};
+use crate::policy::{BuildError, Destination, DestinationGroup, NetworkPolicy, Rule};
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretValue, ViolationAction,
 };
@@ -135,6 +135,40 @@ impl NetworkBuilder {
     /// Set the network policy.
     pub fn policy(mut self, policy: NetworkPolicy) -> Self {
         self.config.policy = policy;
+        self
+    }
+
+    /// Append an egress allow rule for an IP or CIDR — equivalent to
+    /// `policy.rules.push(Rule::allow_egress(Destination::Cidr(...)))`.
+    ///
+    /// The default policy (`NetworkPolicy::public_only`) denies every
+    /// destination group except `Public` + DNS. Hosts on RFC1918,
+    /// loopback, link-local, and the gateway address are rejected with
+    /// ECONNREFUSED at the smoltcp policy gate. This helper punches a hole
+    /// through that default for one specific IP/CIDR — typically a dev box
+    /// on the same LAN as the host.
+    ///
+    /// Rule is appended (not prepended), so explicit deny rules added
+    /// earlier still win. To allow an entire `DestinationGroup` see
+    /// [`Self::allow_egress_group`].
+    pub fn allow_egress_cidr(mut self, cidr: ipnetwork::IpNetwork) -> Self {
+        self.config
+            .policy
+            .rules
+            .push(Rule::allow_egress(Destination::Cidr(cidr)));
+        self
+    }
+
+    /// Append an egress allow rule for an entire `DestinationGroup`
+    /// (Public / Private / Loopback / LinkLocal / Metadata / Host /
+    /// Multicast). The most common use is `Private` — equivalent to
+    /// switching from `NetworkPolicy::public_only` to
+    /// `NetworkPolicy::non_local` without replacing the whole policy.
+    pub fn allow_egress_group(mut self, group: DestinationGroup) -> Self {
+        self.config
+            .policy
+            .rules
+            .push(Rule::allow_egress(Destination::Group(group)));
         self
     }
 
