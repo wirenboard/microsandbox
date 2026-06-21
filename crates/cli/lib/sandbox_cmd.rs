@@ -185,6 +185,13 @@ fn parse_log_level(s: &str) -> Result<LogLevel, String> {
 
 /// Run the sandbox process. This function **never returns**.
 pub fn run(args: SandboxArgs) -> ! {
+    // Make the panic hook (installed in main, before args were
+    // parsed) write directly to runtime.log on a future panic. The
+    // in-process pipe→thread that normally captures stderr can lose
+    // the panic line on abort(); this side-channel is synchronous
+    // and survives.
+    crate::ui::set_sandbox_log_path(args.log_dir.join("runtime.log"));
+
     let parent_watchdog = match args
         .parent_watch_fd
         .map(parent_watchdog_from_fd)

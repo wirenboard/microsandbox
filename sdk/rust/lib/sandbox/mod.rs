@@ -1594,13 +1594,28 @@ async fn wait_for_relay(
                     // an `Other`-stage record so the CLI still renders
                     // the styled error block with the `msb logs` hint
                     // instead of dumping a raw log directory path.
+                    //
+                    // The sandbox subprocess `dup2`s its stderr into
+                    // `runtime.log` (see `runtime/lib/vm.rs::setup_log_capture`)
+                    // so a panic message is invisible to the parent.
+                    // Tail the log into the synthetic message so a
+                    // boot-time `Error creating Kvm object: Error(13)`,
+                    // missing libkrun symbol, kernel-mismatch panic, etc.
+                    // actually reaches the user — without it boot
+                    // failures look identical (just "exited (N) before
+                    // relay became available").
+                    let mut message = format!(
+                        "sandbox process exited ({status}) before agent relay became available"
+                    );
+                    if let Some(tail) = tail_runtime_log(log_dir) {
+                        message.push_str("\n\nruntime.log tail (last lines from the sandbox subprocess stderr):\n");
+                        message.push_str(&tail);
+                    }
                     let synthetic = microsandbox_runtime::boot_error::BootError {
                         t: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                         stage: microsandbox_runtime::boot_error::BootErrorStage::Other,
                         errno: None,
-                        message: format!(
-                            "sandbox process exited ({status}) before agent relay became available"
-                        ),
+                        message,
                     };
                     return Err(crate::MicrosandboxError::BootStart {
                         name: sandbox_name.to_string(),
@@ -1651,6 +1666,49 @@ async fn wait_for_relay(
             }
         }
     }
+}
+
+/// Read the last few lines of `runtime.log` from `log_dir`, capped at
+/// a small byte budget, for inclusion in synthetic `BootError` messages.
+///
+/// Returns `None` if the file is missing/unreadable/empty. Keeps the
+/// surface small (panic lines and `Error creating ...` lines are what
+/// callers care about), indenting each line for the surrounding block.
+fn tail_runtime_log(log_dir: &std::path::Path) -> Option<String> {
+    const MAX_BYTES: u64 = 8 * 1024;
+    const MAX_LINES: usize = 30;
+
+    let path = log_dir.join("runtime.log");
+    let mut file = std::fs::File::open(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(MAX_BYTES);
+    if start > 0 {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::with_capacity(MAX_BYTES as usize);
+    use std::io::Read;
+    file.read_to_end(&mut buf).ok()?;
+
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    // If we seeked into the middle of a line, the first line is partial
+    // — drop it to avoid surfacing torn-in-half log records.
+    let skip = if start > 0 { 1 } else { 0 };
+    let tail: Vec<&str> = lines
+        .iter()
+        .skip(skip)
+        .rev()
+        .take(MAX_LINES)
+        .rev()
+        .copied()
+        .collect();
+    if tail.is_empty() {
+        return None;
+    }
+    let joined = tail.join("\n");
+    let indented: String = joined.lines().map(|l| format!("  {l}\n")).collect();
+    Some(indented)
 }
 
 /// Read `boot-error.json` from `log_dir` if present and parseable.
@@ -3296,5 +3354,78 @@ mod tests {
         // Cleanup the live process.
         unsafe { libc::kill(live_pid, libc::SIGKILL) };
         waiter.join().unwrap();
+    }
+
+    // ── tail_runtime_log ──────────────────────────────────────────────
+
+    #[test]
+    fn tail_runtime_log_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(super::tail_runtime_log(dir.path()).is_none());
+    }
+
+    #[test]
+    fn tail_runtime_log_returns_none_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("runtime.log"), b"").unwrap();
+        assert!(super::tail_runtime_log(dir.path()).is_none());
+    }
+
+    #[test]
+    fn tail_runtime_log_captures_panic_message() {
+        // Real-world shape: a Rust panic emitted by msb_krun_vmm at
+        // boot lands in runtime.log when /dev/kvm is inaccessible.
+        // This is the exact message that motivated this helper.
+        let dir = tempfile::tempdir().unwrap();
+        let body = "2026-05-24T18:55:45.062088Z  INFO microsandbox_runtime::vm: sandbox starting\n\
+                    2026-05-24T18:55:45.071147Z  INFO microsandbox_runtime::relay: agent relay listening\n\
+                    2026-05-24T18:55:45.409140Z  INFO microsandbox_runtime::vm: entering VM\n\
+                    \n\
+                    thread 'main' (10056) panicked at /home/x/msb_krun_vmm-0.1.12/src/linux/vstate.rs:447:30:\n\
+                    Error creating the Kvm object: Error(13)\n\
+                    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        fs::write(dir.path().join("runtime.log"), body).unwrap();
+
+        let tail =
+            super::tail_runtime_log(dir.path()).expect("tail must be Some when log non-empty");
+        // The actionable line MUST be in the tail.
+        assert!(
+            tail.contains("Error creating the Kvm object: Error(13)"),
+            "panic message must reach the user-visible error; got:\n{tail}"
+        );
+        // Indented for nice rendering in the surrounding boot-error block.
+        assert!(tail.starts_with("  "), "lines should be indented; got: {tail:?}");
+    }
+
+    #[test]
+    fn tail_runtime_log_caps_byte_budget_and_skips_torn_first_line() {
+        // Write more than the byte budget (8 KiB) with line markers
+        // so we can verify (1) only the tail comes back, and (2) the
+        // partial-from-seek first line is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = String::new();
+        for i in 0..2000 {
+            body.push_str(&format!("line-{i:05}\n"));
+        }
+        let final_line_marker = "FINAL_LINE_MARKER_xyz";
+        body.push_str(final_line_marker);
+        body.push('\n');
+        fs::write(dir.path().join("runtime.log"), &body).unwrap();
+
+        let tail = super::tail_runtime_log(dir.path()).expect("tail must be Some");
+        assert!(
+            tail.contains(final_line_marker),
+            "should include the most recent lines"
+        );
+        // The earliest lines (line-00000 etc) must not be present —
+        // they're far outside the byte budget.
+        assert!(
+            !tail.contains("line-00000"),
+            "should not include lines outside the byte budget"
+        );
+        // The byte budget is 8 KiB; the indented result is bounded
+        // by ~MAX_LINES * (indent + line len) ≈ 30 * (2 + 11 + 1) = 420 bytes.
+        // Loose upper bound: must be way under file size.
+        assert!(tail.len() < body.len(), "tail must be a strict suffix");
     }
 }
