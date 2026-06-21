@@ -63,6 +63,22 @@ pub const FILE_MOUNTS_DIR: &str = "/.msb/file-mounts";
 /// Guest path for named scripts (added to PATH by agentd).
 pub const SCRIPTS_PATH: &str = "/.msb/scripts";
 
+/// Filename, under the runtime dir (host) / [`RUNTIME_MOUNT_POINT`] (guest),
+/// of the boot-params side channel.
+///
+/// The path-bearing mount specs ([`PATH_BEARING_ENV_KEYS`]) travel here
+/// instead of the kernel command line. libkrun packs the guest workdir and
+/// every guest env var into one printable-ASCII-only cmdline blob (its
+/// `Cmdline` validator accepts `' '..='~'` and `.unwrap()`s the rest), so a
+/// non-ASCII or whitespace guest path on the cmdline panics the VMM before
+/// boot. A file on the runtime virtiofs share is byte-transparent — UTF-8,
+/// `':'`, `';'`, and spaces all survive — and also sidesteps the cmdline
+/// size limit. Format: a sequence of `KEY\tVALUE\n` lines, where `VALUE`
+/// is the verbatim `MSB_*` value (the same string that would otherwise be
+/// the cmdline env value). agentd reads it during init, after the runtime
+/// fs is mounted, and overlays the parsed specs onto the env-derived params.
+pub const BOOT_PARAMS_FILE: &str = "boot-params";
+
 /// Maximum number of simultaneous SDK clients the host relay admits.
 pub const AGENT_RELAY_MAX_CLIENTS: u32 = 128;
 
@@ -230,6 +246,19 @@ pub const ENV_FILE_MOUNTS: &str = "MSB_FILE_MOUNTS";
 /// - `MSB_DISK_MOUNTS=seed_7f:/seed:ro` — autodetect fstype, read-only
 /// - `MSB_DISK_MOUNTS=a_1:/a:fstype=ext4;b_2:/b:ro,noexec` — two disks
 pub const ENV_DISK_MOUNTS: &str = "MSB_DISK_MOUNTS";
+
+/// The `MSB_*` env keys whose values embed an absolute *guest* path and so
+/// must travel via the [`BOOT_PARAMS_FILE`] side channel instead of the
+/// printable-ASCII-only kernel command line.
+///
+/// The host producer drops these keys from the cmdline env and writes them
+/// to the boot-params file; agentd reads the file during init and overlays
+/// the parsed specs. Keep this list and the producer/consumer in agreement:
+/// every key here MUST be both written by the producer and read by the
+/// consumer, or its mounts silently vanish. Non-path env (hostname, net,
+/// rlimits, block-root device node) stays on the cmdline — it is always
+/// ASCII and small.
+pub const PATH_BEARING_ENV_KEYS: &[&str] = &[ENV_DIR_MOUNTS, ENV_FILE_MOUNTS, ENV_DISK_MOUNTS];
 
 /// Environment variable carrying the default guest user for agentd execs.
 ///

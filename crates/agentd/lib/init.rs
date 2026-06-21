@@ -28,6 +28,15 @@ pub fn init(
         linux::mount_block_root(spec)?;
     }
     before_user_mounts()?;
+    // The path-bearing mount specs (dir/file/disk) travel via the runtime
+    // virtiofs share, not the kernel command line — the cmdline can't carry
+    // a non-ASCII or whitespace guest path without panicking the VMM. Read
+    // them now: the runtime fs is mounted (and `mount_block_root` has bound
+    // it into the pivoted root), and we're still before the mounts are
+    // applied. Overlaying here — ahead of the restricted-profile flag
+    // hardening below — ensures side-channel mounts get the same nosuid/nodev
+    // treatment. An absent file is a no-op (back-compat).
+    params.overlay_boot_params_file()?;
     if params.security_profile == SecurityProfile::Restricted {
         force_restricted_mount_flags(&mut params);
     }

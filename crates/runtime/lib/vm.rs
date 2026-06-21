@@ -1140,6 +1140,13 @@ fn build_vm(
 
     // Execution configuration.
     prepend_scripts_path(&mut exec_env);
+    // Path-bearing mount specs carry absolute guest paths that may be
+    // non-ASCII (e.g. a Cyrillic project dir) or contain whitespace.
+    // libkrun packs all guest env into the kernel command line, which it
+    // validates as printable-ASCII-only and `.unwrap()`s — a stray byte
+    // panics the VMM before boot. Route those vars through the runtime
+    // virtiofs share (read by agentd during init) instead of the cmdline.
+    relocate_path_bearing_env(&config.runtime_dir, &mut exec_env)?;
     builder = builder.exec(|mut e| {
         if let Some(ref path) = vm.exec_path {
             e = e.path(path);
@@ -1656,6 +1663,70 @@ pub fn append_block_root_env(env: &mut Vec<String>) {
         return;
     }
     env.push(format!("{prefix}/dev/vda"));
+}
+
+/// Move the path-bearing `MSB_*` env vars off the kernel command line and
+/// into the runtime virtiofs share, so a non-ASCII or whitespace guest path
+/// (which libkrun's printable-ASCII-only cmdline validator would reject,
+/// `.unwrap()`-panicking the VMM) reaches agentd intact.
+///
+/// `exec_env` is filtered in place: every `KEY=VALUE` whose `KEY` is in
+/// [`microsandbox_protocol::PATH_BEARING_ENV_KEYS`] is removed and appended
+/// to `<runtime_dir>/<BOOT_PARAMS_FILE>` as a `KEY\tVALUE\n` line. The TAB
+/// framing keeps the value byte-transparent (UTF-8, `':'`, `';'`, spaces all
+/// survive). Non-path env stays on the cmdline. The file is written only
+/// when at least one such var is present; agentd treats an absent file as
+/// "no side-channel mounts" and falls back to the (now-empty) cmdline values.
+fn relocate_path_bearing_env(
+    runtime_dir: &std::path::Path,
+    exec_env: &mut Vec<String>,
+) -> RuntimeResult<()> {
+    let path = runtime_dir.join(microsandbox_protocol::BOOT_PARAMS_FILE);
+    let mut boot_params = String::new();
+    let mut kept = Vec::with_capacity(exec_env.len());
+    for kv in exec_env.drain(..) {
+        match kv.split_once('=') {
+            Some((key, value)) if microsandbox_protocol::PATH_BEARING_ENV_KEYS.contains(&key) => {
+                // A TAB or newline in the value would break the
+                // `KEY\tVALUE\n` framing (TAB mis-splits, newline mis-frames
+                // the next line). Callers are expected to screen guest paths
+                // — control characters are rejected upstream of this point —
+                // but fail loud here rather than silently corrupt the file.
+                if value.contains(['\t', '\n']) {
+                    return Err(RuntimeError::Custom(format!(
+                        "{key} value contains a tab or newline that the boot-params \
+                         channel can't frame: {value:?}"
+                    )));
+                }
+                boot_params.push_str(key);
+                boot_params.push('\t');
+                boot_params.push_str(value);
+                boot_params.push('\n');
+            }
+            _ => kept.push(kv),
+        }
+    }
+    *exec_env = kept;
+    if boot_params.is_empty() {
+        // No path-bearing vars this run. Remove any stale file so a reused
+        // runtime_dir from an earlier run can't shadow the (now-empty)
+        // cmdline values.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(RuntimeError::Custom(format!(
+                    "removing stale boot-params {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    } else {
+        std::fs::write(&path, boot_params).map_err(|e| {
+            RuntimeError::Custom(format!("writing boot-params {}: {e}", path.display()))
+        })?;
+    }
+    Ok(())
 }
 
 /// Prepend `/.msb/scripts` to PATH for the initial guest command.
