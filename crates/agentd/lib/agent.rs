@@ -1125,14 +1125,24 @@ fn request_guest_poweroff() -> AgentdResult<()> {
     }
 
     if crate::handoff::is_pid_1() {
-        // PID 1 mode (no handoff): remount root RO and reboot.
+        // PID 1 mode (no handoff): flush, remount root RO, flush again, then
+        // return so agentd — which IS the libkrun init/workload — exits via
+        // main's `process::exit(0)`. libkrun tears the VM down when its
+        // workload exits, so this is the fast, clean shutdown.
+        //
+        // We deliberately do NOT `reboot(RB_POWER_OFF)` here: the libkrunfw
+        // guest kernel has no power-off method, so that call prints
+        // "reboot: Power off not available: System halted instead" and parks
+        // the vCPUs in a HLT loop *without ever returning* — agentd never gets
+        // to exit, the VMM never sees the workload leave, and the host is
+        // forced to wait out its full `SHUTDOWN_FLUSH_TIMEOUT` (~8s) on every
+        // stop. Letting the workload exit instead brings teardown back to
+        // ~0.3s. The `sync()` above already made the block-backed roots durable,
+        // so nothing is lost. (Handoff mode, below, is unchanged: there a real
+        // init owns PID 1, so we signal it rather than exiting agentd.)
         let _ = remount_root_readonly();
         unsafe {
             libc::sync();
-        }
-        let ret = unsafe { libc::reboot(libc::RB_POWER_OFF) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error().into());
         }
         return Ok(());
     }
