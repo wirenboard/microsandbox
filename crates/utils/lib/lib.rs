@@ -106,7 +106,14 @@ pub const SANDBOXFILE_NAME: &str = "Sandboxfile";
 //--------------------------------------------------------------------------------------------------
 
 /// GitHub organization.
-pub const GITHUB_ORG: &str = "superradcompany";
+///
+/// Points at Wiren Board's fork so every release artifact this crate resolves
+/// (agentd, libkrunfw, the msb bundle — see the `*_download_url` helpers below,
+/// and `msb self update`) comes from our fork, never upstream. NOTE: the
+/// `wirenboard/microsandbox` repo must publish the matching release assets for
+/// the `prebuilt` download path to work; agent-vm's own build sidesteps it by
+/// compiling agentd/msb from the pinned source (`--no-default-features`).
+pub const GITHUB_ORG: &str = "wirenboard";
 
 /// Main repository name.
 pub const MICROSANDBOX_REPO: &str = "microsandbox";
