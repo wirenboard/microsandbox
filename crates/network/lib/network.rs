@@ -195,6 +195,19 @@ impl SmoltcpNetwork {
     /// spawning proxy tasks, DNS resolution, and published port listeners.
     pub fn start(&mut self, tokio_handle: tokio::runtime::Handle) {
         let shared = self.shared.clone();
+        // Pick up the host's HTTP proxy environment once at boot, mirroring how
+        // reqwest auto-detects it for host-side pulls. With it set, the smoltcp
+        // proxy tasks tunnel guest egress through it via HTTP CONNECT (see
+        // `crate::http_proxy`); without it they connect directly, as before.
+        if let Some(proxy) = crate::http_proxy::ProxyConfig::from_env() {
+            tracing::info!(
+                https = ?proxy.https_display(),
+                http = ?proxy.http_display(),
+                no_proxy = ?proxy.no_proxy_display(),
+                "guest egress will tunnel through host HTTP proxy",
+            );
+            shared.set_proxy(proxy);
+        }
         let poll_config = PollLoopConfig {
             gateway_mac: self.gateway_mac,
             guest_mac: self.guest_mac,

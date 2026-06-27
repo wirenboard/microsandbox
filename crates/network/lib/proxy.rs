@@ -116,12 +116,22 @@ impl ConnectTarget {
 //--------------------------------------------------------------------------------------------------
 
 /// Dial `dst` and update proxy state; wakes the poll thread on failure.
+///
+/// Routes through the host HTTP proxy via `CONNECT` when one is configured
+/// and applies to `dst`, else connects directly. `host` names the SNI/origin
+/// in the `CONNECT` line (so `no_proxy`-by-name and proxy-side resolution
+/// work for TLS); pass `None` for plain TCP, where exclusion is by IP/CIDR.
+/// `tls` selects the per-scheme proxy endpoint. Host-alias connections are
+/// rewritten to loopback in `dst`, which `http_proxy` never proxies, so they
+/// always go direct.
 pub(crate) async fn connect_upstream(
     dst: SocketAddr,
+    host: Option<&str>,
+    tls: bool,
     proxy_connect: &ProxyConnectState,
     shared: &SharedState,
 ) -> io::Result<TcpStream> {
-    match TcpStream::connect(dst).await {
+    match crate::http_proxy::connect_upstream(shared.proxy(), dst, host, tls).await {
         Ok(s) => {
             proxy_connect.mark_connected();
             Ok(s)
@@ -259,7 +269,12 @@ async fn tcp_proxy_task(
     // server-first protocol (SSH, SMTP, a database) sends nothing until it has
     // seen the server's banner; with the socket already open we can relay that
     // banner while we wait, instead of burning the peek budget pre-connect.
-    let stream = connect_upstream(connect_dst, &proxy_connect, &shared).await?;
+    //
+    // `connect_upstream` tunnels through the host HTTP proxy when configured.
+    // This is the plain-TCP path, so exclusion is by IP/CIDR (no SNI here yet);
+    // pass the peeked `sni` when domain rules surfaced one.
+    let stream =
+        connect_upstream(connect_dst, sni.as_deref(), false, &proxy_connect, &shared).await?;
     let (mut server_rx, mut server_tx) = stream.into_split();
 
     // Finish classifying the first flight (TLS vs plain HTTP) and, for
@@ -1802,5 +1817,137 @@ mod tests {
         let wire = String::from_utf8_lossy(&sink.await.unwrap()).into_owned();
         assert!(wire.contains(&body), "got {} bytes", wire.len());
         assert!(!wire.contains("$MSB_KEY"), "got: {wire:?}");
+    }
+}
+
+#[cfg(test)]
+mod proxy_egress_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+
+    use crate::http_proxy::ProxyConfig;
+    use crate::http_proxy::test_support::{spawn_connect_proxy, spawn_echo_origin};
+    use crate::policy::{Action, NetworkPolicy};
+    use crate::shared::SharedState;
+
+    /// End-to-end: the real `tcp_proxy_task` must dial its upstream through the
+    /// configured host HTTP proxy via CONNECT, then relay bytes back to the
+    /// guest channel.
+    #[tokio::test]
+    async fn tcp_proxy_task_tunnels_through_http_proxy() {
+        let origin = spawn_echo_origin().await;
+        let (proxy_addr, authority_rx) = spawn_connect_proxy(origin).await;
+
+        let shared = Arc::new(SharedState::new(16));
+        shared.set_proxy(ProxyConfig::from_url(&format!("http://{proxy_addr}")).unwrap());
+
+        // No domain rules → the SYN-handler decision is authoritative and the
+        // task connects straight away.
+        let policy = Arc::new(NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![],
+        });
+
+        // Non-loopback dst so the proxy applies; the fixture proxy ignores the
+        // CONNECT authority and dials the real (loopback) origin.
+        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+
+        let (_guest_tx, guest_rx) = mpsc::channel::<Bytes>(8); // from_smoltcp
+        let (server_tx, mut server_rx) = mpsc::channel::<Bytes>(8); // to_smoltcp
+        let proxy_connect = Arc::new(super::ProxyConnectState::new());
+
+        let task = tokio::spawn(super::tcp_proxy_task(
+            dst,
+            dst,
+            guest_rx,
+            server_tx,
+            shared,
+            policy,
+            Arc::new(super::SecretsConfig::default()),
+            None,
+            proxy_connect.clone(),
+        ));
+
+        // The origin sends its banner unprompted; it must arrive relayed.
+        let relayed = server_rx.recv().await.expect("relayed origin bytes");
+        assert_eq!(&relayed[..], b"HELLO-FROM-ORIGIN");
+
+        // The proxy was asked to reach our destination — proof the CONNECT
+        // path ran rather than a direct dial.
+        assert_eq!(authority_rx.await.unwrap(), "93.184.216.34:443");
+        assert_eq!(
+            proxy_connect.status(),
+            crate::conn::ProxyConnectStatus::Connected
+        );
+
+        // _guest_tx stays open; the task winds down on the origin's EOF.
+        let _ = task.await;
+    }
+
+    /// The shared `connect_upstream` wrapper, called with the TLS-path shape
+    /// (a named SNI host + `tls = true`), must open a CONNECT tunnel that names
+    /// the host (so proxy-side resolution / `no_proxy`-by-name work) and mark
+    /// the connection `Connected`. This is the path `tls/proxy.rs` relies on.
+    #[tokio::test]
+    async fn connect_upstream_wrapper_tunnels_tls_shape_and_marks_connected() {
+        use crate::conn::ProxyConnectStatus;
+        use tokio::io::AsyncReadExt;
+
+        let origin = spawn_echo_origin().await;
+        let (proxy_addr, authority_rx) = spawn_connect_proxy(origin).await;
+
+        let shared = SharedState::new(16);
+        shared.set_proxy(ProxyConfig::from_url(&format!("http://{proxy_addr}")).unwrap());
+        let proxy_connect = super::ProxyConnectState::new();
+
+        // Non-loopback dst so the proxy applies; the fixture ignores the
+        // authority and dials the real (loopback) origin.
+        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let stream = super::connect_upstream(
+            dst,
+            Some("registry.example.test"),
+            true,
+            &proxy_connect,
+            &shared,
+        )
+        .await
+        .expect("tunnel established");
+
+        // CONNECT must name the SNI host, not the IP.
+        assert_eq!(authority_rx.await.unwrap(), "registry.example.test:443");
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
+
+        // The tunnel carries real bytes end-to-end.
+        let (mut rx, _tx) = stream.into_split();
+        let mut buf = Vec::new();
+        rx.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"HELLO-FROM-ORIGIN");
+    }
+
+    /// On a failed upstream dial the wrapper must report
+    /// `UpstreamConnectFailed` (the connection tracker turns that into an RST
+    /// for the guest). Exercised with no proxy and a refused destination port.
+    #[tokio::test]
+    async fn connect_upstream_wrapper_marks_failed_on_connect_error() {
+        use crate::conn::ProxyConnectStatus;
+
+        // Bind then drop to obtain a port that is (almost certainly) refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        drop(listener);
+
+        let shared = SharedState::new(16);
+        let proxy_connect = super::ProxyConnectState::new();
+
+        let res = super::connect_upstream(dst, None, false, &proxy_connect, &shared).await;
+        assert!(res.is_err(), "connect to a closed port must fail");
+        assert_eq!(
+            proxy_connect.status(),
+            ProxyConnectStatus::UpstreamConnectFailed
+        );
     }
 }

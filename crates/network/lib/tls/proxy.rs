@@ -157,6 +157,7 @@ pub(crate) async fn tls_proxy_task(
         tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
         bypass_relay(
             connect_dst,
+            &sni_name,
             initial_buf,
             from_smoltcp,
             to_smoltcp,
@@ -186,6 +187,7 @@ pub(crate) async fn tls_proxy_task(
 /// Bypass mode: plain TCP splice, no TLS termination.
 async fn bypass_relay(
     dst: SocketAddr,
+    sni_name: &str,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
@@ -193,9 +195,11 @@ async fn bypass_relay(
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
 ) -> io::Result<()> {
+    // `connect_upstream` tunnels through the host HTTP proxy when configured,
+    // naming the SNI so the proxy resolves the origin; else connects directly.
     let mut server = match upstream_stream {
         Some(s) => s,
-        None => connect_upstream(dst, &proxy_connect, &shared).await?,
+        None => connect_upstream(dst, Some(sni_name), true, &proxy_connect, &shared).await?,
     };
     server.write_all(&initial_buf).await?;
 
@@ -303,10 +307,12 @@ pub(crate) async fn intercept_relay(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
 
-    // Connect to real server with TLS.
+    // Connect to the real server — through the host HTTP proxy when configured
+    // (named by SNI), else directly. The upstream TLS handshake below then runs
+    // over the tunnel exactly as over a direct socket, so the MITM is intact.
     let server_stream = match upstream_stream {
         Some(s) => s,
-        None => connect_upstream(connect_dst, &proxy_connect, &shared).await?,
+        None => connect_upstream(connect_dst, Some(sni_name), true, &proxy_connect, &shared).await?,
     };
     let server_name = ServerName::try_from(sni_name.to_string())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -560,4 +566,62 @@ async fn flush_to_guest(
         }
     }
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+
+    use crate::conn::{ProxyConnectState, ProxyConnectStatus};
+    use crate::http_proxy::ProxyConfig;
+    use crate::http_proxy::test_support::{spawn_connect_proxy, spawn_echo_origin};
+    use crate::shared::SharedState;
+
+    /// TLS bypass re-origination must tunnel through the configured host proxy,
+    /// naming the SNI in the CONNECT line — the path `tls_proxy_task` takes when
+    /// `should_bypass` is true. (The plain-TCP path has its own end-to-end test
+    /// in `crate::proxy`; this covers the TLS relay wiring `tls=true` + SNI.)
+    #[tokio::test]
+    async fn bypass_relay_tunnels_through_proxy_named_by_sni() {
+        let origin = spawn_echo_origin().await;
+        let (proxy_addr, authority_rx) = spawn_connect_proxy(origin).await;
+
+        let shared = Arc::new(SharedState::new(16));
+        shared.set_proxy(ProxyConfig::from_url(&format!("http://{proxy_addr}")).unwrap());
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+
+        // Keep `_from_tx` alive so the guest→server branch doesn't see a closed
+        // channel and break before the origin's banner is relayed.
+        let (_from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+
+        // Non-loopback dst so the proxy applies; the fixture ignores the
+        // authority and dials the real (loopback) origin.
+        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let task = tokio::spawn(super::bypass_relay(
+            dst,
+            "bypassed.test",
+            Vec::new(),
+            from_rx,
+            to_tx,
+            shared,
+            proxy_connect.clone(),
+            None,
+        ));
+
+        let relayed = to_rx.recv().await.expect("relayed origin bytes");
+        assert_eq!(&relayed[..], b"HELLO-FROM-ORIGIN");
+        assert_eq!(authority_rx.await.unwrap(), "bypassed.test:443");
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
+
+        let _ = task.await;
+    }
 }
