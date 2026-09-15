@@ -102,7 +102,7 @@ pub(crate) fn reserved_label_prefix(key: &str) -> Option<&'static str> {
 
 pub use crate::db::entity::sandbox::SandboxStatus;
 pub use crate::logs::{LogEntry, LogOptions, LogSource, LogStreamOptions};
-pub use attach::AttachOptionsBuilder;
+pub use attach::{AttachOptionsBuilder, StdinFilter};
 pub use builder::{RegistryConfigBuilder, SandboxBuilder};
 pub use config::SandboxConfig;
 pub use exec::{ExecOptionsBuilder, ExecOutput, Rlimit, RlimitResource};
