@@ -1,5 +1,7 @@
 //! Interactive attach types for terminal bridging with sandboxes.
 
+use std::{fmt, future::Future, pin::Pin};
+
 use microsandbox_types::EnvVar;
 
 use crate::MicrosandboxResult;
@@ -15,7 +17,7 @@ use super::exec::Rlimit;
 /// The host terminal is set to raw mode for the duration of the attach session.
 /// The guest process runs in a PTY, enabling terminal features (colors, line
 /// editing, Ctrl+C → SIGINT).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct AttachOptions {
     /// Arguments.
     pub(crate) args: Vec<String>,
@@ -37,6 +39,28 @@ pub struct AttachOptions {
 
     /// Resource limits.
     pub(crate) rlimits: Vec<Rlimit>,
+
+    /// Transforms terminal input before it is sent to the guest.
+    pub(crate) stdin_filter: Option<Box<dyn StdinFilter>>,
+}
+
+/// Hook applied to every chunk of terminal input during an attach session,
+/// after the detach-key scan. Returns the bytes to send to the guest (possibly
+/// empty). Chunks are filtered in order on a separate task, so a filter may
+/// do I/O (e.g. push a file into the guest) before letting a key through
+/// without stalling the session's output. Local backend only.
+pub trait StdinFilter: Send + 'static {
+    /// Returns the bytes to forward for one chunk of terminal input.
+    fn filter<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'a>>;
+}
+
+impl fmt::Debug for dyn StdinFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StdinFilter")
+    }
 }
 
 /// Builder for `AttachOptions`.
@@ -130,6 +154,12 @@ impl AttachOptionsBuilder {
             soft,
             hard,
         });
+        self
+    }
+
+    /// Transform terminal input before it reaches the guest (see [`StdinFilter`]).
+    pub fn stdin_filter(mut self, filter: impl StdinFilter) -> Self {
+        self.options.stdin_filter = Some(Box::new(filter));
         self
     }
 
@@ -247,7 +277,33 @@ pub(crate) mod local {
         cmd: String,
         opts_builder: AttachOptionsBuilder,
     ) -> MicrosandboxResult<i32> {
-        let opts = opts_builder.build()?;
+        let mut opts = opts_builder.build()?;
+        // The filter runs on its own task: the loop below must keep draining
+        // guest output while a chunk is being filtered, or a filter that
+        // waits on the guest (an fs write, say) deadlocks against backpressure.
+        // Unbounded towards the worker so the loop never parks on a full
+        // channel (input is terminal-rate anyway); the worker is aborted with
+        // the session.
+        let (filter_tx, mut filtered_rx, filter_task) = match opts.stdin_filter.take() {
+            Some(mut f) => {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                let task = tokio::spawn(async move {
+                    while let Some(chunk) = rx.recv().await {
+                        if out_tx.send(f.filter(&chunk).await).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                (Some(tx), Some(out_rx), Some(task))
+            }
+            None => (None, None, None),
+        };
+        let _filter_guard = scopeguard::guard(filter_task, |t| {
+            if let Some(t) = t {
+                t.abort();
+            }
+        });
 
         let client = Arc::new(super::super::fs::local::connect_agent(local, name).await?);
 
@@ -331,12 +387,37 @@ pub(crate) mod local {
                                 break;
                             }
 
+                            if let Some(tx) = &filter_tx
+                                && tx.send(data.to_vec()).is_ok()
+                            {
+                                continue;
+                            }
+                            // Worker gone (panicked filter): its queued input
+                            // is lost; flush what it produced, then send directly.
+                            if let Some(rx) = filtered_rx.as_mut() {
+                                while let Ok(queued) = rx.try_recv() {
+                                    let payload = ExecStdin { data: queued };
+                                    let _ = client.send(id, MessageType::ExecStdin, &payload).await;
+                                }
+                            }
                             let payload = ExecStdin { data: data.to_vec() };
                             let _ = client.send(id, MessageType::ExecStdin, &payload).await;
                         }
                         Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Ok(Err(_)) => break,
                         Err(_would_block) => continue,
+                    }
+                }
+
+                Some(data) = async {
+                    match filtered_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if !data.is_empty() {
+                        let payload = ExecStdin { data };
+                        let _ = client.send(id, MessageType::ExecStdin, &payload).await;
                     }
                 }
 
